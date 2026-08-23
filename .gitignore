@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.streamlit/secrets.toml
+flow_b_cache/prepared_dashboard.pkl
+flow_b_cache/prepared_dashboard.meta.json
+.DS_Store
+Thumbs.db

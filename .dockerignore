@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+run-tunnel.ps1
+deploy.ps1
+flow_b_cache/prepared_dashboard.pkl
+flow_b_cache/prepared_dashboard.meta.json
