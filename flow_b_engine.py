@@ -19,8 +19,10 @@ For each pair of consecutive earnings dates:
 4. No trade until SMA200 exists (200 daily closes). Then reject if price
    spent more than N days below SMA200 from anchor through entry
    (N swept: 10, 20, 25).
-5. Exit at t+3 around the next earnings date, only after entry.
-6. At entry, capture 9/21/50 EMA distance and above/below flag.
+5. Skip the pair if consecutive Yahoo dates are more than
+   MAX_EARNINGS_GAP_DAYS apart (a hole in the calendar, not one quarter).
+6. Exit at t+3 around the next earnings date, only after entry.
+7. At entry, capture 9/21/50 EMA distance and above/below flag.
    SMA 20/50/200 is tracked separately for comparison only.
 
 Autopsy compares top 10% vs bottom 10% trades on MA position + distance.
@@ -35,6 +37,9 @@ CACHE_DIR = SCRIPT_DIR / "flow_b_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
 EARNINGS_EXIT_OFFSET_GRID = [3]  # t+3 fixed
+# One quarter only. Q3→Q4 is routinely 105–116 calendar days; cache p99 is 136.
+# Wider than this is a skipped print (Yahoo hole), not the next earnings.
+MAX_EARNINGS_GAP_DAYS = 140
 DROPS = [-0.20, -0.25]
 VOL_MULTS = [7.0, 10.0]  # not in user list; leftover from looser group
 EMA21_DIST_THRESH_GRID = [-0.13, -0.15, -0.18]  # require dist_ema21_pct <= threshold
@@ -476,6 +481,17 @@ def _naive_timestamps(idx) -> list[pd.Timestamp]:
     return sorted(idx.unique())
 
 
+def _as_naive_day(ts) -> pd.Timestamp:
+    ts = pd.Timestamp(ts)
+    if ts.tz is not None:
+        ts = ts.tz_convert("America/New_York").tz_localize(None)
+    return ts.normalize()
+
+
+def _calendar_gap_days(start, end) -> int:
+    return int((_as_naive_day(end) - _as_naive_day(start)).days)
+
+
 def _priced_session_idx(index: pd.DatetimeIndex, ts) -> int:
     """
     Index of the first daily bar whose session traded with earnings public.
@@ -652,6 +668,9 @@ def find_entries(prepared, drop_thresh, vol_mult, ema21_dist_thresh):
 
         for i in range(len(dates) - 1):
             ev_date, next_ev_date = dates[i], dates[i + 1]
+            gap_days = _calendar_gap_days(ev_date, next_ev_date)
+            if gap_days < 1 or gap_days > MAX_EARNINGS_GAP_DAYS:
+                continue
             start_idx = _priced_session_idx(px.index, ev_date)
             end_idx = _priced_session_idx(px.index, next_ev_date)
             if start_idx >= len(px) or end_idx >= len(px) or end_idx <= start_idx:
@@ -692,6 +711,7 @@ def find_entries(prepared, drop_thresh, vol_mult, ema21_dist_thresh):
                 "ticker": tkr,
                 "earnings_start": ev_date,
                 "earnings_next": next_ev_date,
+                "earn_gap_days": gap_days,
                 "entry_date": entry_date,
                 "entry_price": entry_price,
                 "entry_drawdown": entry_price / float(anchor_price) - 1,
@@ -709,15 +729,23 @@ def find_entries(prepared, drop_thresh, vol_mult, ema21_dist_thresh):
 def apply_exit(entries, prepared, exit_offset):
     rows = []
     for e in entries:
+        gap = e.get("earn_gap_days")
+        if gap is None:
+            gap = _calendar_gap_days(e["earnings_start"], e["earnings_next"])
+        if gap < 1 or gap > MAX_EARNINGS_GAP_DAYS:
+            continue
         px = prepared[e["ticker"]]["px"]
         exit_idx = e["_end_idx"] + exit_offset
         if exit_idx < 0 or exit_idx >= len(px) or exit_idx <= e["_entry_idx"]:
             continue
+        exit_ts = px.index[exit_idx]
         exit_price = float(px.iloc[exit_idx])
         row = {k: v for k, v in e.items() if not k.startswith("_")}
         row.update({
             "holding_days": exit_idx - e["_entry_idx"],
-            "exit_date": px.index[exit_idx],
+            "calendar_hold_days": _calendar_gap_days(e["entry_date"], exit_ts),
+            "earn_gap_days": int(gap),
+            "exit_date": exit_ts,
             "exit_price": exit_price,
             "exit_offset": exit_offset,
             "outcome_return": exit_price / e["entry_price"] - 1,

@@ -47,8 +47,13 @@ def _load_engine():
     return mod
 
 
+def _engine_stamp() -> str:
+    stt = ENGINE_PATH.stat()
+    return f"{stt.st_mtime_ns}:{stt.st_size}"
+
+
 @st.cache_resource(show_spinner="Loading engine…")
-def get_engine():
+def get_engine(stamp: str):
     return _load_engine()
 
 
@@ -165,8 +170,8 @@ def ensure_spike(engine, prepared, vol_mult: float):
 
 
 @st.cache_resource(show_spinner="Loading cache + building MAs (first time only)…")
-def get_prepared():
-    engine = get_engine()
+def get_prepared(stamp: str):
+    engine = get_engine(stamp)
     tickers, prices, volumes, earnings_dict, meta = load_cache_only(engine)
     fp = _prepared_fingerprint(engine)
     cached = engine._load_cache(PREPARED_NAME)
@@ -201,6 +206,9 @@ def summarize(trades: list[dict]) -> dict:
             "skew": np.nan,
             "mean_hold": np.nan,
             "median_hold": np.nan,
+            "max_hold": np.nan,
+            "max_cal_hold": np.nan,
+            "max_earn_gap": np.nan,
             "mean_entry_pct": np.nan,
             "n_sub5": 0,
             "pct_sub5": np.nan,
@@ -225,6 +233,13 @@ def summarize(trades: list[dict]) -> dict:
         "skew": float(rets.skew()),
         "mean_hold": float(df["holding_days"].mean()),
         "median_hold": float(df["holding_days"].median()),
+        "max_hold": int(df["holding_days"].max()),
+        "max_cal_hold": int(df["calendar_hold_days"].max())
+        if "calendar_hold_days" in df.columns
+        else np.nan,
+        "max_earn_gap": int(df["earn_gap_days"].max())
+        if "earn_gap_days" in df.columns
+        else np.nan,
         "mean_entry_pct": float(df["entry_pct"].mean()),
         "n_sub5": n_sub5,
         "pct_sub5": n_sub5 / len(df),
@@ -465,6 +480,8 @@ def sweep_results_df(rows: list[dict]) -> pd.DataFrame:
         "balance",
         "n_tickers",
         "n_sub5",
+        "max_hold",
+        "max_earn_gap",
         "max",
         "min",
     ]
@@ -593,6 +610,17 @@ def _pills_html(drop, vol_mult, ema21_dist, sma200_max_days, exit_offset, min_en
     return f'<div class="fb-pills">{inner}</div>'
 
 
+def _hold_sub(stats: dict) -> str:
+    maxh = stats.get("max_hold")
+    maxg = stats.get("max_earn_gap")
+    bits = ["median sessions"]
+    if maxh is not None and pd.notna(maxh):
+        bits.append(f"max {int(maxh)}")
+    if maxg is not None and pd.notna(maxg):
+        bits.append(f"print gap ≤{int(maxg)}d")
+    return " · ".join(bits)
+
+
 def _results_html(stats: dict) -> str:
     win = f"{stats['win']:.1%}" if pd.notna(stats["win"]) else "—"
     sub5 = (
@@ -614,7 +642,11 @@ def _results_html(stats: dict) -> str:
         + _card("P90", _fmt_pct(stats["p90"]), cls=_cls(stats["p90"]))
         + _card("Min", _fmt_pct(stats["min"]), cls=_cls(stats["min"]))
         + _card("Max", _fmt_pct(stats["max"]), cls=_cls(stats["max"]))
-        + _card("Hold", f"{hold}d" if hold != "—" else "—", "median days")
+        + _card(
+            "Hold",
+            f"{hold} sess" if hold != "—" else "—",
+            _hold_sub(stats),
+        )
         + _card("Sub-$5", sub5)
     )
     return f'<div class="fb-hero">{hero}</div><div class="fb-fine">{fine}</div>'
@@ -672,12 +704,16 @@ def render_trades(trades, *, download_name: str):
     tdf = pd.DataFrame(trades)
     show_cols = [
         "ticker",
+        "earnings_start",
+        "earnings_next",
+        "earn_gap_days",
         "entry_date",
         "exit_date",
+        "holding_days",
+        "calendar_hold_days",
         "entry_price",
         "exit_price",
         "outcome_return",
-        "holding_days",
         "entry_drawdown",
         "dist_ema21_pct",
         "days_below_sma200",
@@ -685,8 +721,9 @@ def render_trades(trades, *, download_name: str):
     ]
     show_cols = [c for c in show_cols if c in tdf.columns]
     view = tdf[show_cols].copy()
-    view["entry_date"] = pd.to_datetime(view["entry_date"]).dt.strftime("%Y-%m-%d")
-    view["exit_date"] = pd.to_datetime(view["exit_date"]).dt.strftime("%Y-%m-%d")
+    for col in ("entry_date", "exit_date", "earnings_start", "earnings_next"):
+        if col in view.columns:
+            view[col] = pd.to_datetime(view[col]).dt.strftime("%Y-%m-%d")
 
     left, right = st.columns(2)
     with left:
@@ -705,18 +742,40 @@ def render_trades(trades, *, download_name: str):
         hist = tdf["bucket"].value_counts().reindex(labels).fillna(0).astype(int)
         st.bar_chart(hist)
 
+    trade_cols = {
+        "earnings_start": st.column_config.TextColumn("Print 1"),
+        "earnings_next": st.column_config.TextColumn("Print 2"),
+        "earn_gap_days": st.column_config.NumberColumn("Print gap", help="Calendar days between the two earnings prints. Cap is 140 (Yahoo hole, not one quarter)."),
+        "holding_days": st.column_config.NumberColumn("Sessions", help="Trading bars from entry to next-earnings + t+N. A full quarter is often 40–90."),
+        "calendar_hold_days": st.column_config.NumberColumn("Cal days", help="Calendar days from entry to exit. Q4 (Nov→Mar) + t+3 can reach ~140."),
+        "outcome_return": st.column_config.NumberColumn("Return", format="+0.0%"),
+        "entry_drawdown": st.column_config.NumberColumn("Drawdown", format="+0.0%"),
+        "dist_ema21_pct": st.column_config.NumberColumn("EMA21 dist", format="+0.0%"),
+        "entry_pct": st.column_config.NumberColumn("Entry % of window", format="0.0%"),
+    }
+
+    st.caption(
+        "Exit = next earnings print + t+N (one quarter). Sessions = trading bars. "
+        "Yahoo consecutive dates more than 140 calendar days apart are skipped (missing print, not a long quarter)."
+    )
+
     st.markdown("**Worst 10 / best 10**")
     ranked = view.sort_values("outcome_return")
     b1, b2 = st.columns(2)
     with b1:
         st.caption("Worst")
-        st.dataframe(ranked.head(10), hide_index=True, use_container_width=True)
+        st.dataframe(ranked.head(10), hide_index=True, use_container_width=True, column_config=trade_cols)
     with b2:
         st.caption("Best")
-        st.dataframe(ranked.tail(10).iloc[::-1], hide_index=True, use_container_width=True)
+        st.dataframe(ranked.tail(10).iloc[::-1], hide_index=True, use_container_width=True, column_config=trade_cols)
 
     with st.expander(f"All {len(view):,} trades"):
-        st.dataframe(view.sort_values("outcome_return", ascending=False), hide_index=True, use_container_width=True)
+        st.dataframe(
+            view.sort_values("outcome_return", ascending=False),
+            hide_index=True,
+            use_container_width=True,
+            column_config=trade_cols,
+        )
 
     csv = tdf.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -733,7 +792,7 @@ def render_tuner(engine, prepared, meta, skipped):
 
     with st.sidebar:
         st.header("Parameters")
-        if st.button("Reset to 1,058 combo", use_container_width=True):
+        if st.button("Reset to default combo", use_container_width=True):
             for k, v in DEFAULTS.items():
                 st.session_state[k] = v
             st.rerun()
@@ -913,7 +972,7 @@ def render_sweep(engine, prepared, meta, skipped):
     if b1.button("Preset: last opt grid", use_container_width=True):
         _apply_sweep_preset("opt")
         st.rerun()
-    if b2.button("Preset: locked 1,058 combo", use_container_width=True):
+    if b2.button("Preset: locked default combo", use_container_width=True):
         _apply_sweep_preset("locked")
         st.rerun()
 
@@ -1076,6 +1135,8 @@ def render_sweep(engine, prepared, meta, skipped):
             "balance": st.column_config.NumberColumn("Balance", format="0.000"),
             "n_tickers": st.column_config.NumberColumn("Tickers", format="%d"),
             "n_sub5": st.column_config.NumberColumn("Sub-$5", format="%d"),
+            "max_hold": st.column_config.NumberColumn("Max sess", format="%d"),
+            "max_earn_gap": st.column_config.NumberColumn("Max print gap", format="%d"),
             "max": st.column_config.NumberColumn("Max", format="+0.0%"),
             "min": st.column_config.NumberColumn("Min", format="+0.0%"),
         },
@@ -1093,7 +1154,7 @@ def main():
     st.markdown(CSS, unsafe_allow_html=True)
 
     try:
-        engine, prepared, meta, skipped = get_prepared()
+        engine, prepared, meta, skipped = get_prepared(_engine_stamp())
     except FileNotFoundError as e:
         st.error(str(e))
         st.stop()
