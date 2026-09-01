@@ -36,6 +36,18 @@ Public URL while this PC is on:
 
 First boot rebuilds moving averages and writes `prepared_dashboard.pkl` (gitignored).
 
+Optional EPS-beat filter (Yahoo `Surprise(%)` on the print you enter after, not GAAP NI):
+
+```powershell
+python flow_b_engine.py --fetch-surprise
+```
+
+Date-logic check (print gaps, BMO/AMC, hold cannot span a skipped quarter):
+
+```powershell
+python flow_b_engine.py --stress-dates
+```
+
 ## Streamlit Community Cloud
 
 1. Push this folder to GitHub (see `deploy.ps1`).

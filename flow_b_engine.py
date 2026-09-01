@@ -21,8 +21,11 @@ For each pair of consecutive earnings dates:
    (N swept: 10, 20, 25).
 5. Skip the pair if consecutive Yahoo dates are more than
    MAX_EARNINGS_GAP_DAYS apart (a hole in the calendar, not one quarter).
-6. Exit at t+3 around the next earnings date, only after entry.
-7. At entry, capture 9/21/50 EMA distance and above/below flag.
+6. Optional: skip unless Yahoo EPS surprise on *this* print (the one we
+   enter after) is > 0. Missing estimate = skip. This is EPS vs consensus,
+   not GAAP net income.
+7. Exit at t+3 around the next earnings date, only after entry.
+8. At entry, capture 9/21/50 EMA distance and above/below flag.
    SMA 20/50/200 is tracked separately for comparison only.
 
 Autopsy compares top 10% vs bottom 10% trades on MA position + distance.
@@ -563,6 +566,153 @@ def _load_earnings_dates(tickers: list[str], workers: int = 6) -> dict:
     return {t: cached.get(t, []) for t in tickers}
 
 
+def _col_by_keyword(df: pd.DataFrame, *needles: str):
+    """Match a column whose lowercased name contains every needle."""
+    for c in df.columns:
+        name = str(c).lower().replace(" ", "")
+        if all(n.replace(" ", "") in name for n in needles):
+            return c
+    return None
+
+
+def _parse_earnings_surprise(df: pd.DataFrame) -> dict:
+    """
+    Yahoo get_earnings_dates → {YYYY-MM-DD: {surprise, eps_estimate, eps_reported}}.
+
+    Surprise is stored as a ratio (6.74% → 0.0674). Yahoo's column is Surprise(%).
+    """
+    if df is None or df.empty:
+        return {}
+    surprise_col = _col_by_keyword(df, "surprise")
+    est_col = _col_by_keyword(df, "estimate")
+    rep_col = _col_by_keyword(df, "reported")
+    out = {}
+    for ts, row in df.iterrows():
+        try:
+            day = _as_naive_day(ts).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        surprise = row[surprise_col] if surprise_col is not None else np.nan
+        est = row[est_col] if est_col is not None else np.nan
+        rep = row[rep_col] if rep_col is not None else np.nan
+        rec = {
+            "surprise": None if pd.isna(surprise) else float(surprise) / 100.0,
+            "eps_estimate": None if pd.isna(est) else float(est),
+            "eps_reported": None if pd.isna(rep) else float(rep),
+        }
+        prev = out.get(day)
+        if prev is None or (prev.get("surprise") is None and rec["surprise"] is not None):
+            out[day] = rec
+    return out
+
+
+def get_earnings_records(ticker: str) -> dict:
+    """Yahoo EPS estimate / reported / surprise for one ticker. {} on failure."""
+    t = yf.Ticker(ticker)
+    df = None
+    for _ in range(2):
+        try:
+            df = t.get_earnings_dates(limit=24)
+            break
+        except Exception:
+            time.sleep(0.4)
+    if df is None or df.empty:
+        return {}
+    try:
+        return _parse_earnings_surprise(df)
+    except Exception:
+        return {}
+
+
+def _surprise_cache_to_dict(cached) -> dict:
+    if cached is None:
+        return {}
+    if isinstance(cached, pd.Series):
+        raw = cached.to_dict()
+    elif isinstance(cached, dict):
+        raw = cached
+    else:
+        return {}
+    out = {}
+    for k, v in raw.items():
+        if isinstance(v, dict):
+            out[str(k)] = v
+        else:
+            out[str(k)] = {}
+    return out
+
+
+def _load_earnings_surprise(tickers: list[str], workers: int = 6) -> dict:
+    """Fetch Yahoo EPS surprise for missing tickers. Incremental save every 100."""
+    today_fp = _today()
+    cached = _surprise_cache_to_dict(_load_cache("earnings_surprise"))
+
+    if _cache_fingerprint("earnings_surprise") == today_fp:
+        missing = [t for t in tickers if t not in cached]
+    else:
+        missing = [t for t in tickers if t not in cached or not cached[t]]
+
+    if missing:
+        print(f"  [surprise] fetching {len(missing)} tickers ({workers} workers)", flush=True)
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(get_earnings_records, t): t for t in missing}
+            for fut in as_completed(futs):
+                tkr = futs[fut]
+                try:
+                    cached[tkr] = fut.result()
+                except Exception:
+                    cached[tkr] = {}
+                done += 1
+                if done % 50 == 0 or done == len(missing):
+                    print(f"  [surprise] {done}/{len(missing)}", flush=True)
+                if done % 100 == 0:
+                    _save_cache(
+                        "earnings_surprise",
+                        pd.Series(cached),
+                        fingerprint=today_fp,
+                    )
+        _save_cache("earnings_surprise", pd.Series(cached), fingerprint=today_fp)
+    else:
+        print("  [surprise] cache hit")
+
+    return {t: cached.get(t, {}) for t in tickers}
+
+
+def attach_eps_surprise(prepared: dict, surprise_dict: dict) -> int:
+    """Put per-day EPS surprise onto each prepared ticker. Returns names with data."""
+    n = 0
+    surprise_dict = surprise_dict or {}
+    for tkr, data in prepared.items():
+        recs = surprise_dict.get(tkr) or {}
+        data["eps_surprise"] = recs
+        if recs:
+            n += 1
+    return n
+
+
+def _eps_surprise_on_print(data, ev_date) -> float:
+    """Yahoo EPS surprise ratio for this print. NaN if missing."""
+    recs = data.get("eps_surprise") or {}
+    rec = recs.get(_as_naive_day(ev_date).strftime("%Y-%m-%d"))
+    if rec is None:
+        return np.nan
+    val = rec.get("surprise") if isinstance(rec, dict) else rec
+    if val is None:
+        return np.nan
+    try:
+        val = float(val)
+    except (TypeError, ValueError):
+        return np.nan
+    return val if np.isfinite(val) else np.nan
+
+
+def print_eps_beat(data, ev_date) -> bool:
+    """True iff Yahoo EPS surprise on this print is strictly > 0."""
+    s = _eps_surprise_on_print(data, ev_date)
+    return bool(pd.notna(s) and s > 0)
+
+
 # ── MA / volume helpers ──────────────────────────────────────────────────
 def volume_spike_prefix(volume, mult):
     trailing_avg = volume.shift(1).rolling(window=20, min_periods=1).mean()
@@ -655,7 +805,7 @@ def _ma_fields(entry_price, mas, entry_date) -> dict:
     return out
 
 
-def find_entries(prepared, drop_thresh, vol_mult, ema21_dist_thresh):
+def find_entries(prepared, drop_thresh, vol_mult, ema21_dist_thresh, require_eps_beat=False):
     """Entry-side trades only. Exit offset is applied afterwards (cheap)."""
     rows = []
     for tkr, data in prepared.items():
@@ -670,6 +820,9 @@ def find_entries(prepared, drop_thresh, vol_mult, ema21_dist_thresh):
             ev_date, next_ev_date = dates[i], dates[i + 1]
             gap_days = _calendar_gap_days(ev_date, next_ev_date)
             if gap_days < 1 or gap_days > MAX_EARNINGS_GAP_DAYS:
+                continue
+            surprise = _eps_surprise_on_print(data, ev_date)
+            if require_eps_beat and not (pd.notna(surprise) and surprise > 0):
                 continue
             start_idx = _priced_session_idx(px.index, ev_date)
             end_idx = _priced_session_idx(px.index, next_ev_date)
@@ -719,6 +872,7 @@ def find_entries(prepared, drop_thresh, vol_mult, ema21_dist_thresh):
                 "period_trading_days": trading_days_in_period,
                 "entry_pct": entry_offset_in_period / trading_days_in_period,
                 "days_below_sma200": days_below_sma200,
+                "eps_surprise": surprise,
                 "_entry_idx": entry_idx,
                 "_end_idx": end_idx,
                 **_ma_fields(entry_price, mas, entry_date),
@@ -962,6 +1116,265 @@ def run_trade_autopsy(trades_df: pd.DataFrame, out_dir: str, *, tag: str = "20pc
     print("=" * W)
 
 
+# ── date-logic stress test ───────────────────────────────────────────────
+# Worst-case calendar hold = print gap + AMC shift + t+N sessions + weekends.
+MAX_CAL_HOLD_SLACK_DAYS = 21
+MAX_HOLDING_SESSIONS = 110
+
+
+def _unit_test_priced_session() -> list[str]:
+    """BMO / AMC / weekend / holiday on a synthetic weekday index."""
+    fails = []
+    idx = pd.DatetimeIndex(pd.date_range("2024-01-02", periods=10, freq="B"))
+    # 2024-01-02 Tue ... 01-05 Fri, 01-08 Mon
+
+    def expect(ts, want, label):
+        got_i = _priced_session_idx(idx, pd.Timestamp(ts))
+        got = idx[got_i] if 0 <= got_i < len(idx) else None
+        want_ts = pd.Timestamp(want)
+        if got != want_ts:
+            fails.append(f"{label}: priced {ts} → {got} want {want_ts}")
+
+    expect("2024-01-03 08:00:00", "2024-01-03", "BMO same day")
+    expect("2024-01-03 09:30:00", "2024-01-03", "open same day")
+    expect("2024-01-03 15:59:00", "2024-01-03", "during same day")
+    expect("2024-01-03 16:00:00", "2024-01-04", "AMC next session")
+    expect("2024-01-03 21:00:00", "2024-01-04", "late AMC next session")
+    expect("2024-01-05 16:00:00", "2024-01-08", "Friday AMC → Monday")
+    expect("2024-01-05 08:00:00", "2024-01-05", "Friday BMO same day")
+
+    # Friday holiday: Thursday AMC should skip the missing Friday.
+    no_fri = idx.delete(idx.get_loc(pd.Timestamp("2024-01-05")))
+    got_i = _priced_session_idx(no_fri, pd.Timestamp("2024-01-04 16:00:00"))
+    got = no_fri[got_i]
+    if got != pd.Timestamp("2024-01-08"):
+        fails.append(f"holiday AMC: Thursday AMC → {got} want 2024-01-08")
+    return fails
+
+
+def _unit_test_surprise_parse() -> list[str]:
+    """EPS surprise parse + beat gate (Yahoo Surprise(%) is percent, stored as ratio)."""
+    fails = []
+    idx = pd.DatetimeIndex(["2024-01-03 16:00:00"]).tz_localize("America/New_York")
+    df = pd.DataFrame(
+        {"EPS Estimate": [1.0], "Reported EPS": [1.1], "Surprise(%)": [10.0]},
+        index=idx,
+    )
+    recs = _parse_earnings_surprise(df)
+    rec = recs.get("2024-01-03")
+    if rec is None or rec.get("surprise") is None or abs(float(rec["surprise"]) - 0.10) > 1e-9:
+        fails.append(f"surprise parse: {recs}")
+    data = {"eps_surprise": recs}
+    if not print_eps_beat(data, pd.Timestamp("2024-01-03 16:00:00")):
+        fails.append("print_eps_beat should be True on +10%")
+    if print_eps_beat({"eps_surprise": {"2024-01-03": {"surprise": -0.01}}}, pd.Timestamp("2024-01-03")):
+        fails.append("negative surprise should not beat")
+    if print_eps_beat({"eps_surprise": {"2024-01-03": {"surprise": 0.0}}}, pd.Timestamp("2024-01-03")):
+        fails.append("zero surprise should not beat")
+    if print_eps_beat({"eps_surprise": {}}, pd.Timestamp("2024-01-03")):
+        fails.append("missing surprise should not beat")
+    return fails
+
+
+def stress_test_date_logic(
+    prices_all=None,
+    earnings_dict=None,
+    prepared=None,
+    *,
+    exit_offset: int = 3,
+) -> dict:
+    """
+    Confirm print pairing cannot hold through a skipped quarter.
+
+    Unit tests always run. Universe checks need prices + earnings.
+    If `prepared` is given, also assert actual trades stay inside the cap.
+    """
+    fails = _unit_test_priced_session() + _unit_test_surprise_parse()
+    stats = {
+        "n_tickers": 0,
+        "n_pairs": 0,
+        "n_kept": 0,
+        "n_hole": 0,
+        "n_no_bars": 0,
+        "n_same_day": 0,
+        "n_same_bar": 0,
+        "max_gap_kept": 0,
+        "max_possible_cal_hold": 0,
+        "max_possible_sessions": 0,
+        "n_trades_checked": 0,
+        "max_trade_gap": 0,
+        "max_trade_cal_hold": 0,
+        "max_trade_sessions": 0,
+        "fails": fails,
+        "ok": False,
+    }
+
+    if earnings_dict is not None and prices_all is not None:
+        for tkr, dates in earnings_dict.items():
+            if tkr not in prices_all.columns or len(dates) < 2:
+                continue
+            px = _align_naive(prices_all[tkr]).dropna()
+            if px.empty:
+                continue
+            stats["n_tickers"] += 1
+            for i in range(len(dates) - 1):
+                ev, nxt = dates[i], dates[i + 1]
+                stats["n_pairs"] += 1
+                gap = _calendar_gap_days(ev, nxt)
+                if gap < 1:
+                    stats["n_same_day"] += 1
+                    continue
+                if gap > MAX_EARNINGS_GAP_DAYS:
+                    stats["n_hole"] += 1
+                    continue
+                start_idx = _priced_session_idx(px.index, ev)
+                end_idx = _priced_session_idx(px.index, nxt)
+                first_bar = px.index[0]
+                if start_idx >= len(px) or end_idx >= len(px):
+                    stats["n_no_bars"] += 1
+                    continue
+                # searchsorted lands on 0 for prints before the 5y price window.
+                if _as_naive_day(ev) < first_bar or _as_naive_day(nxt) < first_bar:
+                    stats["n_no_bars"] += 1
+                    continue
+                if end_idx <= start_idx:
+                    stats["n_same_bar"] += 1
+                    continue
+                stats["n_kept"] += 1
+                stats["max_gap_kept"] = max(stats["max_gap_kept"], gap)
+                first_entry = start_idx + 1
+                exit_idx = end_idx + int(exit_offset)
+                if first_entry >= len(px) or exit_idx >= len(px) or exit_idx <= first_entry:
+                    continue
+                cal = _calendar_gap_days(px.index[first_entry], px.index[exit_idx])
+                sess = exit_idx - first_entry
+                stats["max_possible_cal_hold"] = max(stats["max_possible_cal_hold"], cal)
+                stats["max_possible_sessions"] = max(stats["max_possible_sessions"], sess)
+                if gap > MAX_EARNINGS_GAP_DAYS:
+                    fails.append(f"{tkr}: kept gap {gap}d > {MAX_EARNINGS_GAP_DAYS}")
+                if cal > MAX_EARNINGS_GAP_DAYS + MAX_CAL_HOLD_SLACK_DAYS:
+                    fails.append(
+                        f"{tkr}: possible calendar hold {cal}d "
+                        f"(gap {gap}d, slack {MAX_CAL_HOLD_SLACK_DAYS})"
+                    )
+                if sess > MAX_HOLDING_SESSIONS:
+                    fails.append(f"{tkr}: possible sessions {sess} > {MAX_HOLDING_SESSIONS}")
+                if px.index[exit_idx] < px.index[end_idx]:
+                    fails.append(f"{tkr}: exit before next-print priced bar")
+
+    if prepared is not None:
+        entries = find_entries(prepared, -0.25, 7.0, -0.18, require_eps_beat=False)
+        trades = apply_exit(entries, prepared, int(exit_offset))
+        stats["n_trades_checked"] = len(trades)
+        for t in trades:
+            gap = int(t.get("earn_gap_days") or 0)
+            cal = int(t.get("calendar_hold_days") or 0)
+            sess = int(t.get("holding_days") or 0)
+            stats["max_trade_gap"] = max(stats["max_trade_gap"], gap)
+            stats["max_trade_cal_hold"] = max(stats["max_trade_cal_hold"], cal)
+            stats["max_trade_sessions"] = max(stats["max_trade_sessions"], sess)
+            if gap < 1 or gap > MAX_EARNINGS_GAP_DAYS:
+                fails.append(
+                    f"{t['ticker']} {t.get('entry_date')}: trade gap {gap}d"
+                )
+            if cal > MAX_EARNINGS_GAP_DAYS + MAX_CAL_HOLD_SLACK_DAYS:
+                fails.append(
+                    f"{t['ticker']} {t.get('entry_date')}: calendar hold {cal}d"
+                )
+            if sess > MAX_HOLDING_SESSIONS:
+                fails.append(
+                    f"{t['ticker']} {t.get('entry_date')}: sessions {sess}"
+                )
+            if pd.Timestamp(t["entry_date"]) >= pd.Timestamp(t["exit_date"]):
+                fails.append(f"{t['ticker']}: entry >= exit")
+            if pd.Timestamp(t["earnings_start"]) >= pd.Timestamp(t["earnings_next"]):
+                fails.append(f"{t['ticker']}: print1 >= print2")
+
+    stats["n_fails"] = len(fails)
+    stats["ok"] = len(fails) == 0
+    return stats
+
+
+def _print_date_stress(stats: dict):
+    print("=" * 72)
+    print("DATE-LOGIC STRESS")
+    print("=" * 72)
+    print(f"  fail count:          {stats['n_fails']}")
+    print(f"  tickers:             {stats['n_tickers']}")
+    print(f"  pairs:               {stats['n_pairs']}")
+    print(f"  kept (gap 1–{MAX_EARNINGS_GAP_DAYS}d): {stats['n_kept']}")
+    print(f"  skipped Yahoo holes: {stats['n_hole']}")
+    print(f"  same-day stamps:     {stats['n_same_day']}")
+    print(f"  same priced bar:     {stats['n_same_bar']}")
+    print(f"  no bars:             {stats['n_no_bars']}")
+    print(f"  max kept gap:        {stats['max_gap_kept']}d")
+    print(f"  max possible cal:    {stats['max_possible_cal_hold']}d")
+    print(f"  max possible sess:   {stats['max_possible_sessions']}")
+    print(f"  trades checked:      {stats['n_trades_checked']}")
+    if stats["n_trades_checked"]:
+        print(f"  max trade gap:       {stats['max_trade_gap']}d")
+        print(f"  max trade cal:       {stats['max_trade_cal_hold']}d")
+        print(f"  max trade sess:      {stats['max_trade_sessions']}")
+    if stats["ok"]:
+        print("  RESULT: PASS")
+    else:
+        print("  RESULT: FAIL")
+        for line in stats["fails"][:40]:
+            print("   -", line)
+        extra = stats["n_fails"] - 40
+        if extra > 0:
+            print(f"   … {extra} more")
+    print("=" * 72)
+
+
+def _cli_fetch_surprise():
+    universe = _cached_ticker_list("r3000")
+    if not universe:
+        universe = _load_r3000()
+    universe = _dedupe_tickers(universe)
+    print(f"Fetching EPS surprise for {len(universe)} tickers")
+    recs = _load_earnings_surprise(universe)
+    n_ok = sum(1 for v in recs.values() if v)
+    n_beat = 0
+    n_days = 0
+    for v in recs.values():
+        for rec in v.values():
+            n_days += 1
+            s = rec.get("surprise") if isinstance(rec, dict) else rec
+            if s is not None and s > 0:
+                n_beat += 1
+    print(f"  {n_ok} tickers with surprise rows, {n_days} prints, {n_beat} with surprise > 0")
+
+
+def _cli_stress_dates():
+    fails = _unit_test_priced_session()
+    if fails:
+        print("Unit tests failed before cache load:")
+        for line in fails:
+            print(" -", line)
+    prices = _load_cache("prices_close")
+    earnings = _load_cache("earnings_dates")
+    if not isinstance(prices, pd.DataFrame) or earnings is None:
+        print("Cache missing prices_close / earnings_dates. Unit tests only.")
+        stats = stress_test_date_logic()
+        _print_date_stress(stats)
+        raise SystemExit(0 if stats["ok"] else 1)
+    if isinstance(earnings, pd.Series):
+        earnings_dict = {str(k): (list(v) if v is not None else []) for k, v in earnings.to_dict().items()}
+    else:
+        earnings_dict = {str(k): (list(v) if v is not None else []) for k, v in dict(earnings).items()}
+    prepared = None
+    cached = _load_cache("prepared_dashboard")
+    if isinstance(cached, dict) and "prepared" in cached:
+        prepared = cached["prepared"]
+        print(f"  also checking {len(prepared)} prepared tickers' actual trades")
+    stats = stress_test_date_logic(
+        prices, earnings_dict, prepared, exit_offset=3
+    )
+    _print_date_stress(stats)
+    raise SystemExit(0 if stats["ok"] else 1)
+
+
 def main():
     print("Loading ticker universe...")
     UNIVERSE = _load_r3000()
@@ -1099,4 +1512,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--fetch-surprise" in sys.argv:
+        _cli_fetch_surprise()
+    elif "--stress-dates" in sys.argv:
+        _cli_stress_dates()
+    else:
+        main()

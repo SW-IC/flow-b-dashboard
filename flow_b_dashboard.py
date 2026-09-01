@@ -35,6 +35,7 @@ DEFAULTS = {
     "sma200_max_days": 25,
     "exit_offset": 3,
     "min_entry_price": 0.0,
+    "require_eps_beat": False,
 }
 
 
@@ -117,17 +118,21 @@ def load_cache_only(engine):
     universe = engine._dedupe_tickers(_cache_series_to_list(r3000))
     priced = [t for t in universe if t in prices.columns and prices[t].notna().any()]
     earnings_dict = _earnings_to_dict(earnings)
+    surprise = engine._surprise_cache_to_dict(engine._load_cache("earnings_surprise"))
     meta = {
         "cache_dir": str(engine.CACHE_DIR),
         "r3000_fp": engine._cache_fingerprint("r3000") or "unknown",
         "prices_fp": engine._cache_fingerprint("prices_close") or "unknown",
         "earnings_fp": engine._cache_fingerprint("earnings_dates") or "unknown",
+        "surprise_fp": engine._cache_fingerprint("earnings_surprise") or "missing",
         "n_universe": len(universe),
         "n_priced": len(priced),
         "n_price_cols": int(prices.shape[1]),
         "price_rows": int(prices.shape[0]),
+        "n_surprise_tickers": sum(1 for v in surprise.values() if v),
+        "n_surprise_days": sum(len(v) for v in surprise.values()),
     }
-    return priced, prices, volumes, earnings_dict, meta
+    return priced, prices, volumes, earnings_dict, surprise, meta
 
 
 def prepare_universe(engine, tickers, prices_all, volumes_all, earnings_dict):
@@ -172,7 +177,7 @@ def ensure_spike(engine, prepared, vol_mult: float):
 @st.cache_resource(show_spinner="Loading cache + building MAs (first time only)…")
 def get_prepared(stamp: str):
     engine = get_engine(stamp)
-    tickers, prices, volumes, earnings_dict, meta = load_cache_only(engine)
+    tickers, prices, volumes, earnings_dict, surprise, meta = load_cache_only(engine)
     fp = _prepared_fingerprint(engine)
     cached = engine._load_cache(PREPARED_NAME)
     cached_fp = engine._cache_fingerprint(PREPARED_NAME)
@@ -180,12 +185,14 @@ def get_prepared(stamp: str):
         prepared = cached["prepared"]
         skipped = cached.get("skipped", {})
         meta = {**meta, **cached.get("meta", {}), "prepared_source": "pickle"}
+        engine.attach_eps_surprise(prepared, surprise)
         return engine, prepared, meta, skipped
 
     prepared, skipped = prepare_universe(engine, tickers, prices, volumes, earnings_dict)
     payload = {"prepared": prepared, "skipped": skipped, "meta": meta}
     engine._save_cache(PREPARED_NAME, payload, fingerprint=fp)
     meta = {**meta, "prepared_source": "built", "n_prepared": len(prepared)}
+    engine.attach_eps_surprise(prepared, surprise)
     return engine, prepared, meta, skipped
 
 
@@ -268,10 +275,13 @@ def run_combo(
     sma200_max_days: int,
     exit_offset: int,
     min_entry_price: float,
+    require_eps_beat: bool = False,
 ):
     vol_mult = float(vol_mult)
     ensure_spike(engine, prepared, vol_mult)
-    entries = engine.find_entries(prepared, drop, vol_mult, ema21_dist)
+    entries = engine.find_entries(
+        prepared, drop, vol_mult, ema21_dist, require_eps_beat=bool(require_eps_beat)
+    )
     entries = [e for e in entries if e["days_below_sma200"] <= sma200_max_days]
     if min_entry_price > 0:
         entries = [e for e in entries if e["entry_price"] >= min_entry_price]
@@ -285,6 +295,7 @@ def run_combo(
             "sma200_max_days": int(sma200_max_days),
             "exit_offset": int(exit_offset),
             "min_entry_price": float(min_entry_price),
+            "require_eps_beat": bool(require_eps_beat),
         }
     )
     return trades, stats
@@ -431,7 +442,7 @@ def collect_sweep_grid(modes: dict, const_vals: dict, sweep_text: dict):
     return combos, {"n_entry": n_entry, "display": display}, None
 
 
-def run_sweep_grid(engine, prepared, combos, progress=None):
+def run_sweep_grid(engine, prepared, combos, progress=None, require_eps_beat=False):
     groups = {}
     for c in combos:
         k = (c["drop"], c["vol_mult"], c["ema21_dist"])
@@ -443,7 +454,9 @@ def run_sweep_grid(engine, prepared, combos, progress=None):
         if progress:
             progress(i - 1, n_groups, drop, vol, ema)
         ensure_spike(engine, prepared, float(vol))
-        entries = engine.find_entries(prepared, drop, float(vol), ema)
+        entries = engine.find_entries(
+            prepared, drop, float(vol), ema, require_eps_beat=bool(require_eps_beat)
+        )
         for c in subset:
             filtered = [e for e in entries if e["days_below_sma200"] <= c["sma200_max_days"]]
             if c["min_entry_price"] > 0:
@@ -451,6 +464,7 @@ def run_sweep_grid(engine, prepared, combos, progress=None):
             trades = engine.apply_exit(filtered, prepared, int(c["exit_offset"]))
             stats = summarize(trades)
             stats.update(c)
+            stats["require_eps_beat"] = bool(require_eps_beat)
             n = stats["n"]
             med = stats["median"]
             stats["balance"] = float(med * np.sqrt(n)) if n and pd.notna(med) else np.nan
@@ -511,10 +525,12 @@ def _fmt_num(x, nd=1) -> str:
 
 
 def _combo_label(s: dict) -> str:
+    beat = "  EPS beat" if s.get("require_eps_beat") else ""
     return (
         f"drop {s['drop']:.0%}  vol {s['vol_mult']:.1f}x  "
         f"EMA21 {s['ema21_dist']:.0%}  SMA{int(s['sma200_max_days'])}d  "
         f"t+{int(s['exit_offset'])}  px≥${s['min_entry_price']:.0f}"
+        f"{beat}"
     )
 
 
@@ -594,7 +610,10 @@ def _card(label: str, value: str, sub: str = "", cls: str = "") -> str:
     )
 
 
-def _pills_html(drop, vol_mult, ema21_dist, sma200_max_days, exit_offset, min_entry_price) -> str:
+def _pills_html(
+    drop, vol_mult, ema21_dist, sma200_max_days, exit_offset, min_entry_price,
+    require_eps_beat=False,
+) -> str:
     px = "off" if min_entry_price <= 0 else f"${min_entry_price:.0f}+"
     items = [
         ("Drop", f"{drop:.0%}"),
@@ -603,6 +622,7 @@ def _pills_html(drop, vol_mult, ema21_dist, sma200_max_days, exit_offset, min_en
         ("SMA200", f"≤{int(sma200_max_days)}d"),
         ("Exit", f"t+{int(exit_offset)}"),
         ("Floor", px),
+        ("EPS", "beat >0" if require_eps_beat else "off"),
     ]
     inner = "".join(
         f'<span class="fb-pill"><i>{escape(a)}</i>{escape(b)}</span>' for a, b in items
@@ -656,9 +676,11 @@ def cache_caption(meta, prepared, skipped):
     st.caption(
         f"Cache {meta.get('cache_dir')}\n\n"
         f"R3000 {meta.get('r3000_fp')} · prices {meta.get('prices_fp')} · "
-        f"earnings {meta.get('earnings_fp')}\n\n"
+        f"earnings {meta.get('earnings_fp')} · surprise {meta.get('surprise_fp')}\n\n"
         f"{len(prepared):,} prepared tickers  "
         f"(no px {skipped.get('no_price', 0)}, <2 earnings {skipped.get('no_earnings', 0)})\n\n"
+        f"EPS surprise {meta.get('n_surprise_tickers', 0):,} names / "
+        f"{meta.get('n_surprise_days', 0):,} prints\n\n"
         f"prepared via {meta.get('prepared_source', '?')}"
     )
 
@@ -715,6 +737,7 @@ def render_trades(trades, *, download_name: str):
         "exit_price",
         "outcome_return",
         "entry_drawdown",
+        "eps_surprise",
         "dist_ema21_pct",
         "days_below_sma200",
         "entry_pct",
@@ -750,6 +773,7 @@ def render_trades(trades, *, download_name: str):
         "calendar_hold_days": st.column_config.NumberColumn("Cal days", help="Calendar days from entry to exit. Q4 (Nov→Mar) + t+3 can reach ~140."),
         "outcome_return": st.column_config.NumberColumn("Return", format="+0.0%"),
         "entry_drawdown": st.column_config.NumberColumn("Drawdown", format="+0.0%"),
+        "eps_surprise": st.column_config.NumberColumn("EPS surprise", format="+0.0%", help="Yahoo EPS surprise on the print we enter after. Missing = blank."),
         "dist_ema21_pct": st.column_config.NumberColumn("EMA21 dist", format="+0.0%"),
         "entry_pct": st.column_config.NumberColumn("Entry % of window", format="0.0%"),
     }
@@ -850,6 +874,15 @@ def render_tuner(engine, prepared, meta, skipped):
             value=DEFAULTS["min_entry_price"],
             key="min_entry_price",
         )
+        require_eps_beat = st.checkbox(
+            "Require EPS surprise > 0",
+            value=DEFAULTS["require_eps_beat"],
+            key="require_eps_beat",
+            help=(
+                "Only enter if Yahoo EPS surprise on the print we enter after is > 0. "
+                "Missing estimate = skip. This is EPS vs consensus, not GAAP net income."
+            ),
+        )
         run = st.button("Run", type="primary", use_container_width=True)
 
         st.divider()
@@ -869,6 +902,7 @@ def render_tuner(engine, prepared, meta, skipped):
                 sma200_max_days=int(sma200_max_days),
                 exit_offset=int(exit_offset),
                 min_entry_price=float(min_entry_price),
+                require_eps_beat=bool(require_eps_beat),
             )
         st.session_state.last_trades = trades
         st.session_state.last_stats = stats
@@ -885,6 +919,7 @@ def render_tuner(engine, prepared, meta, skipped):
         "sma200_max_days": int(sma200_max_days),
         "exit_offset": int(exit_offset),
         "min_entry_price": float(min_entry_price),
+        "require_eps_beat": bool(require_eps_beat),
     }
     st.markdown(
         _pills_html(
@@ -894,9 +929,16 @@ def render_tuner(engine, prepared, meta, skipped):
             pill_src["sma200_max_days"],
             pill_src["exit_offset"],
             pill_src["min_entry_price"],
+            pill_src.get("require_eps_beat", False),
         ),
         unsafe_allow_html=True,
     )
+
+    if require_eps_beat and meta.get("surprise_fp") in ("missing", "", None):
+        st.warning(
+            "EPS surprise cache is missing, so this filter will skip every print. "
+            "Run `python flow_b_engine.py --fetch-surprise` once, then reload."
+        )
 
     if stats is None:
         st.info("Hit Run. First click after a cache rebuild is slower; after that, a few seconds.")
@@ -909,6 +951,7 @@ def render_tuner(engine, prepared, meta, skipped):
         and int(sma200_max_days) == int(stats["sma200_max_days"])
         and int(exit_offset) == int(stats["exit_offset"])
         and abs(float(min_entry_price) - stats["min_entry_price"]) < 1e-9
+        and bool(require_eps_beat) == bool(stats.get("require_eps_beat", False))
     )
     if dirty:
         st.markdown(
@@ -931,6 +974,7 @@ def render_tuner(engine, prepared, meta, skipped):
             "sma200_max_days",
             "exit_offset",
             "min_entry_price",
+            "require_eps_beat",
             "n",
             "mean",
             "median",
@@ -965,6 +1009,15 @@ def render_sweep(engine, prepared, meta, skipped):
             key="sw_min_n",
         )
         force = st.checkbox("Allow large grids", value=False, key="sw_force")
+        require_eps_beat = st.checkbox(
+            "Require EPS surprise > 0",
+            value=DEFAULTS["require_eps_beat"],
+            key="require_eps_beat",
+            help=(
+                "Only enter if Yahoo EPS surprise on the print we enter after is > 0. "
+                "Missing estimate = skip. This is EPS vs consensus, not GAAP net income."
+            ),
+        )
         st.divider()
         cache_caption(meta, prepared, skipped)
 
@@ -1080,7 +1133,13 @@ def render_sweep(engine, prepared, meta, skipped):
                 ),
             )
 
-        rows = run_sweep_grid(engine, prepared, combos, progress=progress)
+        rows = run_sweep_grid(
+            engine,
+            prepared,
+            combos,
+            progress=progress,
+            require_eps_beat=bool(st.session_state.get("require_eps_beat", False)),
+        )
         bar.progress(1.0, text=f"Done · {len(rows)} rows")
         st.session_state.sweep_rows = rows
 
@@ -1111,6 +1170,7 @@ def render_sweep(engine, prepared, meta, skipped):
             st.session_state.sma200_max_days = int(winner["sma200_max_days"])
             st.session_state.exit_offset = int(winner["exit_offset"])
             st.session_state.min_entry_price = float(winner["min_entry_price"])
+            st.session_state.require_eps_beat = bool(winner.get("require_eps_beat", False))
             st.session_state.page = "Tuner"
             st.rerun()
         st.markdown(_results_html(winner.to_dict()), unsafe_allow_html=True)
@@ -1155,6 +1215,11 @@ def main():
 
     try:
         engine, prepared, meta, skipped = get_prepared(_engine_stamp())
+        surprise = engine._surprise_cache_to_dict(engine._load_cache("earnings_surprise"))
+        engine.attach_eps_surprise(prepared, surprise)
+        meta["surprise_fp"] = engine._cache_fingerprint("earnings_surprise") or "missing"
+        meta["n_surprise_tickers"] = sum(1 for v in surprise.values() if v)
+        meta["n_surprise_days"] = sum(len(v) for v in surprise.values())
     except FileNotFoundError as e:
         st.error(str(e))
         st.stop()
