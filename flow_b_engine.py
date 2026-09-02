@@ -16,9 +16,15 @@ For each pair of consecutive earnings dates:
 2. Enter at the first later close at or below the drawdown threshold AND far
    enough below EMA21.
 3. Reject if a disqualifying volume spike occurred from anchor through entry.
-4. No trade until SMA200 exists (200 daily closes). Then reject if price
-   spent more than N days below SMA200 from anchor through entry
-   (N swept: 10, 20, 25).
+4. No trade until SMA200 exists (200 daily closes). Then one of two
+   SMA200 gates (dashboard radio; default is days-below):
+   - days-below: reject if close spent more than N days below SMA200
+     from anchor through entry (N swept: 10, 20, 25). A one-day pop
+     does not clear a name that lived under SMA200 before the print —
+     that window only starts at the earnings close.
+   - occupancy: reject unless at least Y% of the last X sessions
+     ending at entry (inclusive) closed at or above SMA200.
+     Default X=20, Y=80. Incomplete window or missing SMA200 = skip.
 5. Skip the pair if consecutive Yahoo dates are more than
    MAX_EARNINGS_GAP_DAYS apart (a hole in the calendar, not one quarter).
 6. Optional: skip unless Yahoo EPS surprise on *this* print (the one we
@@ -47,6 +53,10 @@ DROPS = [-0.20, -0.25]
 VOL_MULTS = [7.0, 10.0]  # not in user list; leftover from looser group
 EMA21_DIST_THRESH_GRID = [-0.13, -0.15, -0.18]  # require dist_ema21_pct <= threshold
 SMA200_MAX_DAYS_BELOW_GRID = [10, 20, 25]
+SMA200_MODE_DAYS_BELOW = "days_below"
+SMA200_MODE_OCCUPANCY = "occupancy"
+SMA200_OCC_LOOKBACK_DEFAULT = 20
+SMA200_OCC_MIN_ABOVE_DEFAULT = 0.80
 MIN_TRADES = 500  # optimizer constraint: n_trades > MIN_TRADES
 
 HTTP_HEADERS = {
@@ -880,6 +890,61 @@ def find_entries(prepared, drop_thresh, vol_mult, ema21_dist_thresh, require_eps
     return rows
 
 
+def sma200_occupancy(px, sma200, entry_idx, lookback: int):
+    """Share of last `lookback` sessions (entry inclusive) with close >= SMA200.
+
+    NaN if the window is incomplete or SMA200 is missing on any bar in it.
+    """
+    lookback = int(lookback)
+    entry_idx = int(entry_idx)
+    if lookback < 1 or entry_idx < 0:
+        return np.nan
+    start = entry_idx - lookback + 1
+    if start < 0:
+        return np.nan
+    w_sma = sma200.iloc[start:entry_idx + 1]
+    if len(w_sma) != lookback or w_sma.isna().any():
+        return np.nan
+    w_px = px.iloc[start:entry_idx + 1]
+    return float((w_px >= w_sma).mean())
+
+
+def attach_sma200_occupancy(entries, prepared, lookback: int):
+    """Write sma200_lookback / sma200_above_pct onto each entry (in place)."""
+    lookback = int(lookback)
+    for e in entries:
+        if e.get("sma200_lookback") == lookback and "sma200_above_pct" in e:
+            continue
+        data = prepared[e["ticker"]]
+        e["sma200_lookback"] = lookback
+        e["sma200_above_pct"] = sma200_occupancy(
+            data["px"], data["mas"]["sma200"], e["_entry_idx"], lookback
+        )
+    return entries
+
+
+def filter_sma200(
+    entries,
+    prepared,
+    *,
+    mode: str = SMA200_MODE_DAYS_BELOW,
+    max_days: int = 25,
+    lookback: int = SMA200_OCC_LOOKBACK_DEFAULT,
+    min_above_pct: float = SMA200_OCC_MIN_ABOVE_DEFAULT,
+):
+    """Apply the selected SMA200 gate. Always attach occupancy for the table."""
+    attach_sma200_occupancy(entries, prepared, lookback)
+    mode = (mode or SMA200_MODE_DAYS_BELOW).strip()
+    if mode == SMA200_MODE_OCCUPANCY:
+        floor = float(min_above_pct)
+        return [
+            e
+            for e in entries
+            if pd.notna(e["sma200_above_pct"]) and e["sma200_above_pct"] + 1e-12 >= floor
+        ]
+    return [e for e in entries if e["days_below_sma200"] <= int(max_days)]
+
+
 def apply_exit(entries, prepared, exit_offset):
     rows = []
     for e in entries:
@@ -1176,6 +1241,58 @@ def _unit_test_surprise_parse() -> list[str]:
     return fails
 
 
+def _unit_test_sma200_occupancy():
+    """One pop over SMA200 must not pass 80%/20d. Incomplete window is NaN."""
+    fails = []
+    idx = pd.bdate_range("2020-01-02", periods=30)
+    sma = pd.Series(100.0, index=idx)
+    px = pd.Series(90.0, index=idx)
+    px.iloc[-1] = 110.0  # one pop on the last bar
+    frac = sma200_occupancy(px, sma, 29, 20)
+    if pd.isna(frac) or abs(frac - 0.05) > 1e-9:
+        fails.append(f"one-pop occupancy expected 0.05, got {frac}")
+    px80 = px.copy()
+    px80.iloc[-16:] = 110.0
+    frac80 = sma200_occupancy(px80, sma, 29, 20)
+    if pd.isna(frac80) or abs(frac80 - 0.80) > 1e-9:
+        fails.append(f"16/20 occupancy expected 0.80, got {frac80}")
+    if pd.notna(sma200_occupancy(px, sma, 5, 20)):
+        fails.append("incomplete lookback should be NaN")
+    sma_gap = sma.copy()
+    sma_gap.iloc[-3] = np.nan
+    if pd.notna(sma200_occupancy(px80, sma_gap, 29, 20)):
+        fails.append("NaN SMA200 in window should be NaN occupancy")
+    # filter: one-pop fails occupancy, 16/20 passes; days-below still counts window
+    prepared = {
+        "POP": {
+            "px": px,
+            "mas": {"sma200": sma},
+        },
+        "OK": {
+            "px": px80,
+            "mas": {"sma200": sma},
+        },
+    }
+    pop_e = [{"ticker": "POP", "days_below_sma200": 0, "_entry_idx": 29}]
+    ok_e = [{"ticker": "OK", "days_below_sma200": 4, "_entry_idx": 29}]
+    occ_pop = filter_sma200(
+        list(pop_e), prepared, mode=SMA200_MODE_OCCUPANCY, lookback=20, min_above_pct=0.80
+    )
+    occ_ok = filter_sma200(
+        list(ok_e), prepared, mode=SMA200_MODE_OCCUPANCY, lookback=20, min_above_pct=0.80
+    )
+    if occ_pop:
+        fails.append("one-pop name must fail occupancy 80%/20d")
+    if len(occ_ok) != 1:
+        fails.append("16/20 name must pass occupancy 80%/20d")
+    below_pop = filter_sma200(
+        list(pop_e), prepared, mode=SMA200_MODE_DAYS_BELOW, max_days=25
+    )
+    if len(below_pop) != 1:
+        fails.append("days-below gate should still keep the one-pop name (count=0)")
+    return fails
+
+
 def stress_test_date_logic(
     prices_all=None,
     earnings_dict=None,
@@ -1189,7 +1306,11 @@ def stress_test_date_logic(
     Unit tests always run. Universe checks need prices + earnings.
     If `prepared` is given, also assert actual trades stay inside the cap.
     """
-    fails = _unit_test_priced_session() + _unit_test_surprise_parse()
+    fails = (
+        _unit_test_priced_session()
+        + _unit_test_surprise_parse()
+        + _unit_test_sma200_occupancy()
+    )
     stats = {
         "n_tickers": 0,
         "n_pairs": 0,
@@ -1413,7 +1534,12 @@ def main():
     for drop, vol_mult, ema21_dist_thresh in entry_combos:
         entries = find_entries(prepared, drop, vol_mult, ema21_dist_thresh)
         for sma200_max_days in SMA200_MAX_DAYS_BELOW_GRID:
-            filtered = [e for e in entries if e["days_below_sma200"] <= sma200_max_days]
+            filtered = filter_sma200(
+                entries,
+                prepared,
+                mode=SMA200_MODE_DAYS_BELOW,
+                max_days=sma200_max_days,
+            )
             for exit_offset in EARNINGS_EXIT_OFFSET_GRID:
                 events = apply_exit(filtered, prepared, exit_offset)
                 n = len(events)

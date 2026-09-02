@@ -32,10 +32,18 @@ DEFAULTS = {
     "drop_pct": 25,          # stored as positive %; engine uses negative
     "vol_mult": 7.0,
     "ema21_pct": 18,         # % below EMA21
+    "sma200_mode": "days_below",  # or "occupancy"
     "sma200_max_days": 25,
+    "sma200_lookback": 20,
+    "sma200_min_above_pct": 80,  # UI percent; engine uses 0.80
     "exit_offset": 3,
     "min_entry_price": 0.0,
     "require_eps_beat": False,
+}
+
+SMA200_MODE_LABELS = {
+    "days_below": "Max days below (anchor → entry)",
+    "occupancy": "% of last X days above SMA200",
 }
 
 
@@ -276,13 +284,23 @@ def run_combo(
     exit_offset: int,
     min_entry_price: float,
     require_eps_beat: bool = False,
+    sma200_mode: str = "days_below",
+    sma200_lookback: int = 20,
+    sma200_min_above_pct: float = 0.80,
 ):
     vol_mult = float(vol_mult)
     ensure_spike(engine, prepared, vol_mult)
     entries = engine.find_entries(
         prepared, drop, vol_mult, ema21_dist, require_eps_beat=bool(require_eps_beat)
     )
-    entries = [e for e in entries if e["days_below_sma200"] <= sma200_max_days]
+    entries = engine.filter_sma200(
+        entries,
+        prepared,
+        mode=sma200_mode,
+        max_days=int(sma200_max_days),
+        lookback=int(sma200_lookback),
+        min_above_pct=float(sma200_min_above_pct),
+    )
     if min_entry_price > 0:
         entries = [e for e in entries if e["entry_price"] >= min_entry_price]
     trades = engine.apply_exit(entries, prepared, int(exit_offset))
@@ -292,7 +310,10 @@ def run_combo(
             "drop": drop,
             "vol_mult": vol_mult,
             "ema21_dist": ema21_dist,
+            "sma200_mode": sma200_mode,
             "sma200_max_days": int(sma200_max_days),
+            "sma200_lookback": int(sma200_lookback),
+            "sma200_min_above_pct": float(sma200_min_above_pct),
             "exit_offset": int(exit_offset),
             "min_entry_price": float(min_entry_price),
             "require_eps_beat": bool(require_eps_beat),
@@ -346,7 +367,7 @@ SWEEP_PARAMS = [
     },
     {
         "key": "sma200_max_days",
-        "label": "SMA200",
+        "label": "SMA200 days-below",
         "unit": "max days below",
         "kind": "int",
         "const_default": 25,
@@ -357,6 +378,37 @@ SWEEP_PARAMS = [
         "step": 1,
         "engine_key": "sma200_max_days",
         "to_engine": lambda xs: [int(x) for x in xs],
+        "sma200_modes": ("days_below",),
+    },
+    {
+        "key": "sma200_lookback",
+        "label": "SMA200 lookback",
+        "unit": "sessions",
+        "kind": "int",
+        "const_default": 20,
+        "mode_default": "Constant",
+        "sweep_default": "10, 20, 40",
+        "min": 5,
+        "max": 60,
+        "step": 1,
+        "engine_key": "sma200_lookback",
+        "to_engine": lambda xs: [int(x) for x in xs],
+        "sma200_modes": ("occupancy",),
+    },
+    {
+        "key": "sma200_min_above_pct",
+        "label": "SMA200 occupancy",
+        "unit": "% of lookback above",
+        "kind": "int",
+        "const_default": 80,
+        "mode_default": "Constant",
+        "sweep_default": "60, 80, 90",
+        "min": 50,
+        "max": 100,
+        "step": 5,
+        "engine_key": "sma200_min_above_pct",
+        "to_engine": lambda xs: [float(x) / 100.0 for x in xs],
+        "sma200_modes": ("occupancy",),
     },
     {
         "key": "exit_offset",
@@ -418,13 +470,27 @@ def parse_num_list(text: str, spec: dict) -> list:
     return out
 
 
-def collect_sweep_grid(modes: dict, const_vals: dict, sweep_text: dict):
+def _spec_active(spec: dict, sma200_mode: str) -> bool:
+    allowed = spec.get("sma200_modes")
+    if not allowed:
+        return True
+    return sma200_mode in allowed
+
+
+def collect_sweep_grid(
+    modes: dict, const_vals: dict, sweep_text: dict, sma200_mode: str = "days_below"
+):
     """Return (engine_value_lists, display_lists, error) keyed by engine_key."""
     display = {}
     engine_lists = {}
     for spec in SWEEP_PARAMS:
         key = spec["key"]
         ek = spec["engine_key"]
+        if not _spec_active(spec, sma200_mode):
+            raw = [spec["const_default"]]
+            display[ek] = raw
+            engine_lists[ek] = spec["to_engine"](raw)
+            continue
         if modes[key] == "Constant":
             raw = [const_vals[key]]
         else:
@@ -437,7 +503,9 @@ def collect_sweep_grid(modes: dict, const_vals: dict, sweep_text: dict):
     keys = [s["engine_key"] for s in SWEEP_PARAMS]
     combos = []
     for tup in itertools.product(*[engine_lists[k] for k in keys]):
-        combos.append(dict(zip(keys, tup)))
+        row = dict(zip(keys, tup))
+        row["sma200_mode"] = sma200_mode
+        combos.append(row)
     n_entry = len({(c["drop"], c["vol_mult"], c["ema21_dist"]) for c in combos})
     return combos, {"n_entry": n_entry, "display": display}, None
 
@@ -458,7 +526,14 @@ def run_sweep_grid(engine, prepared, combos, progress=None, require_eps_beat=Fal
             prepared, drop, float(vol), ema, require_eps_beat=bool(require_eps_beat)
         )
         for c in subset:
-            filtered = [e for e in entries if e["days_below_sma200"] <= c["sma200_max_days"]]
+            filtered = engine.filter_sma200(
+                entries,
+                prepared,
+                mode=c.get("sma200_mode", "days_below"),
+                max_days=int(c.get("sma200_max_days", 25)),
+                lookback=int(c.get("sma200_lookback", 20)),
+                min_above_pct=float(c.get("sma200_min_above_pct", 0.80)),
+            )
             if c["min_entry_price"] > 0:
                 filtered = [e for e in filtered if e["entry_price"] >= c["min_entry_price"]]
             trades = engine.apply_exit(filtered, prepared, int(c["exit_offset"]))
@@ -482,7 +557,10 @@ def sweep_results_df(rows: list[dict]) -> pd.DataFrame:
         "drop",
         "vol_mult",
         "ema21_dist",
+        "sma200_mode",
         "sma200_max_days",
+        "sma200_lookback",
+        "sma200_min_above_pct",
         "exit_offset",
         "min_entry_price",
         "n",
@@ -524,11 +602,19 @@ def _fmt_num(x, nd=1) -> str:
     return f"{x:.{nd}f}"
 
 
+def _sma200_pill(s: dict) -> str:
+    if s.get("sma200_mode") == "occupancy":
+        pct = s.get("sma200_min_above_pct", 0.80)
+        look = int(s.get("sma200_lookback", 20))
+        return f"{pct:.0%}/{look}d"
+    return f"≤{int(s.get('sma200_max_days', 25))}d"
+
+
 def _combo_label(s: dict) -> str:
     beat = "  EPS beat" if s.get("require_eps_beat") else ""
     return (
         f"drop {s['drop']:.0%}  vol {s['vol_mult']:.1f}x  "
-        f"EMA21 {s['ema21_dist']:.0%}  SMA{int(s['sma200_max_days'])}d  "
+        f"EMA21 {s['ema21_dist']:.0%}  SMA200 {_sma200_pill(s)}  "
         f"t+{int(s['exit_offset'])}  px≥${s['min_entry_price']:.0f}"
         f"{beat}"
     )
@@ -613,13 +699,22 @@ def _card(label: str, value: str, sub: str = "", cls: str = "") -> str:
 def _pills_html(
     drop, vol_mult, ema21_dist, sma200_max_days, exit_offset, min_entry_price,
     require_eps_beat=False,
+    sma200_mode="days_below",
+    sma200_lookback=20,
+    sma200_min_above_pct=0.80,
 ) -> str:
     px = "off" if min_entry_price <= 0 else f"${min_entry_price:.0f}+"
+    sma_txt = _sma200_pill({
+        "sma200_mode": sma200_mode,
+        "sma200_max_days": sma200_max_days,
+        "sma200_lookback": sma200_lookback,
+        "sma200_min_above_pct": sma200_min_above_pct,
+    })
     items = [
         ("Drop", f"{drop:.0%}"),
         ("Vol", f"{vol_mult:.1f}×"),
         ("EMA21", f"{ema21_dist:.0%}"),
-        ("SMA200", f"≤{int(sma200_max_days)}d"),
+        ("SMA200", sma_txt),
         ("Exit", f"t+{int(exit_offset)}"),
         ("Floor", px),
         ("EPS", "beat >0" if require_eps_beat else "off"),
@@ -691,15 +786,20 @@ def _apply_sweep_preset(name: str):
         "vol_mult": 7.0,
         "ema21_pct": 18,
         "sma200_max_days": 25,
+        "sma200_lookback": 20,
+        "sma200_min_above_pct": 80,
         "exit_offset": 3,
         "min_entry_price": 0.0,
     }
     if name == "opt":
+        st.session_state.sma200_mode = "days_below"
         modes = {
             "drop_pct": "Sweep",
             "vol_mult": "Constant",
             "ema21_pct": "Sweep",
             "sma200_max_days": "Sweep",
+            "sma200_lookback": "Constant",
+            "sma200_min_above_pct": "Constant",
             "exit_offset": "Constant",
             "min_entry_price": "Constant",
         }
@@ -708,6 +808,8 @@ def _apply_sweep_preset(name: str):
             "vol_mult": "7, 10",
             "ema21_pct": "13, 15, 18",
             "sma200_max_days": "10, 20, 25",
+            "sma200_lookback": "10, 20, 40",
+            "sma200_min_above_pct": "60, 80, 90",
             "exit_offset": "0, 3",
             "min_entry_price": "0, 5",
         }
@@ -740,6 +842,8 @@ def render_trades(trades, *, download_name: str):
         "eps_surprise",
         "dist_ema21_pct",
         "days_below_sma200",
+        "sma200_above_pct",
+        "sma200_lookback",
         "entry_pct",
     ]
     show_cols = [c for c in show_cols if c in tdf.columns]
@@ -775,6 +879,15 @@ def render_trades(trades, *, download_name: str):
         "entry_drawdown": st.column_config.NumberColumn("Drawdown", format="+0.0%"),
         "eps_surprise": st.column_config.NumberColumn("EPS surprise", format="+0.0%", help="Yahoo EPS surprise on the print we enter after. Missing = blank."),
         "dist_ema21_pct": st.column_config.NumberColumn("EMA21 dist", format="+0.0%"),
+        "days_below_sma200": st.column_config.NumberColumn(
+            "Days < SMA200",
+            help="Closes below SMA200 from earnings close through entry. Not a trailing lookback.",
+        ),
+        "sma200_above_pct": st.column_config.NumberColumn(
+            "SMA200 occupancy",
+            format="0.0%",
+            help="Share of last X sessions ending at entry with close ≥ SMA200.",
+        ),
         "entry_pct": st.column_config.NumberColumn("Entry % of window", format="0.0%"),
     }
 
@@ -848,15 +961,59 @@ def render_tuner(engine, prepared, meta, skipped):
             key="ema21_pct",
             help="Entry close must be this far below EMA21. Bigger number = stricter.",
         )
-        sma200_max_days = st.slider(
-            "Max days below SMA200 (anchor → entry)",
-            min_value=0,
-            max_value=60,
-            step=1,
-            value=DEFAULTS["sma200_max_days"],
-            key="sma200_max_days",
-            help="Skip until SMA200 exists. Then reject if price spent more than N days below it.",
+        sma200_mode = st.radio(
+            "SMA200 gate",
+            options=["days_below", "occupancy"],
+            format_func=lambda m: SMA200_MODE_LABELS[m],
+            key="sma200_mode",
+            help=(
+                "Days-below counts closes under SMA200 from the earnings close through entry. "
+                "A name that lived under SMA200 for months can still pass if that window is "
+                "short, or if a one-day bounce cuts the count. "
+                "Occupancy: last X sessions ending at entry, require Y% of closes ≥ SMA200. "
+                "Default 20 sessions / 80%. Incomplete SMA200 window = skip."
+            ),
         )
+        if sma200_mode == "days_below":
+            sma200_max_days = st.slider(
+                "Max days below SMA200 (anchor → entry)",
+                min_value=0,
+                max_value=60,
+                step=1,
+                value=DEFAULTS["sma200_max_days"],
+                key="sma200_max_days",
+                help="Skip until SMA200 exists. Then reject if price spent more than N days below it.",
+            )
+            sma200_lookback = int(
+                st.session_state.get("sma200_lookback", DEFAULTS["sma200_lookback"])
+            )
+            sma200_min_above_ui = int(
+                st.session_state.get(
+                    "sma200_min_above_pct", DEFAULTS["sma200_min_above_pct"]
+                )
+            )
+        else:
+            sma200_max_days = int(
+                st.session_state.get("sma200_max_days", DEFAULTS["sma200_max_days"])
+            )
+            sma200_lookback = st.slider(
+                "SMA200 lookback (sessions)",
+                min_value=5,
+                max_value=60,
+                step=1,
+                value=DEFAULTS["sma200_lookback"],
+                key="sma200_lookback",
+                help="Trading sessions ending at entry, inclusive. Default 20.",
+            )
+            sma200_min_above_ui = st.slider(
+                "Min % of lookback above SMA200",
+                min_value=50,
+                max_value=100,
+                step=5,
+                value=DEFAULTS["sma200_min_above_pct"],
+                key="sma200_min_above_pct",
+                help="80 means at least 16 of the last 20 sessions closed at or above SMA200.",
+            )
         exit_offset = st.slider(
             "Exit offset (sessions after next-earnings priced bar)",
             min_value=0,
@@ -890,6 +1047,7 @@ def render_tuner(engine, prepared, meta, skipped):
 
     drop = -drop_pct / 100.0
     ema21_dist = -ema21_pct / 100.0
+    sma200_min_above = float(sma200_min_above_ui) / 100.0
 
     if run:
         with st.spinner("Scoring universe…"):
@@ -903,6 +1061,9 @@ def render_tuner(engine, prepared, meta, skipped):
                 exit_offset=int(exit_offset),
                 min_entry_price=float(min_entry_price),
                 require_eps_beat=bool(require_eps_beat),
+                sma200_mode=sma200_mode,
+                sma200_lookback=int(sma200_lookback),
+                sma200_min_above_pct=sma200_min_above,
             )
         st.session_state.last_trades = trades
         st.session_state.last_stats = stats
@@ -920,6 +1081,9 @@ def render_tuner(engine, prepared, meta, skipped):
         "exit_offset": int(exit_offset),
         "min_entry_price": float(min_entry_price),
         "require_eps_beat": bool(require_eps_beat),
+        "sma200_mode": sma200_mode,
+        "sma200_lookback": int(sma200_lookback),
+        "sma200_min_above_pct": sma200_min_above,
     }
     st.markdown(
         _pills_html(
@@ -930,6 +1094,9 @@ def render_tuner(engine, prepared, meta, skipped):
             pill_src["exit_offset"],
             pill_src["min_entry_price"],
             pill_src.get("require_eps_beat", False),
+            pill_src.get("sma200_mode", "days_below"),
+            pill_src.get("sma200_lookback", 20),
+            pill_src.get("sma200_min_above_pct", 0.80),
         ),
         unsafe_allow_html=True,
     )
@@ -944,11 +1111,20 @@ def render_tuner(engine, prepared, meta, skipped):
         st.info("Hit Run. First click after a cache rebuild is slower; after that, a few seconds.")
         return
 
+    last_mode = stats.get("sma200_mode", "days_below")
+    sma_dirty = last_mode != sma200_mode
+    if sma200_mode == "days_below":
+        sma_dirty = sma_dirty or int(sma200_max_days) != int(stats.get("sma200_max_days", 25))
+    else:
+        sma_dirty = sma_dirty or int(sma200_lookback) != int(stats.get("sma200_lookback", 20))
+        sma_dirty = sma_dirty or abs(
+            sma200_min_above - float(stats.get("sma200_min_above_pct", 0.80))
+        ) >= 1e-9
     dirty = not (
         abs(drop - stats["drop"]) < 1e-9
         and abs(float(vol_mult) - stats["vol_mult"]) < 1e-9
         and abs(ema21_dist - stats["ema21_dist"]) < 1e-9
-        and int(sma200_max_days) == int(stats["sma200_max_days"])
+        and not sma_dirty
         and int(exit_offset) == int(stats["exit_offset"])
         and abs(float(min_entry_price) - stats["min_entry_price"]) < 1e-9
         and bool(require_eps_beat) == bool(stats.get("require_eps_beat", False))
@@ -971,7 +1147,10 @@ def render_tuner(engine, prepared, meta, skipped):
             "drop",
             "vol_mult",
             "ema21_dist",
+            "sma200_mode",
             "sma200_max_days",
+            "sma200_lookback",
+            "sma200_min_above_pct",
             "exit_offset",
             "min_entry_price",
             "require_eps_beat",
@@ -986,7 +1165,7 @@ def render_tuner(engine, prepared, meta, skipped):
         ]
         keep = [c for c in keep if c in hdf.columns]
         pretty = hdf[keep].copy()
-        for col in ("drop", "ema21_dist", "mean", "median", "win", "gap"):
+        for col in ("drop", "ema21_dist", "sma200_min_above_pct", "mean", "median", "win", "gap"):
             if col in pretty.columns:
                 pretty[col] = pretty[col].map(_fmt_pct)
         st.dataframe(pretty, hide_index=True, use_container_width=True)
@@ -1018,6 +1197,17 @@ def render_sweep(engine, prepared, meta, skipped):
                 "Missing estimate = skip. This is EPS vs consensus, not GAAP net income."
             ),
         )
+        sma200_mode = st.radio(
+            "SMA200 gate",
+            options=["days_below", "occupancy"],
+            format_func=lambda m: SMA200_MODE_LABELS[m],
+            key="sma200_mode",
+            help=(
+                "Days-below: count from earnings close through entry. "
+                "Occupancy: last X sessions ending at entry, Y% of closes ≥ SMA200 "
+                "(default 20 / 80%)."
+            ),
+        )
         st.divider()
         cache_caption(meta, prepared, skipped)
 
@@ -1043,9 +1233,15 @@ def render_sweep(engine, prepared, meta, skipped):
         )
         st.session_state.setdefault(f"sw_list_{spec['key']}", spec["sweep_default"])
 
+    sma200_mode = st.session_state.get("sma200_mode", DEFAULTS["sma200_mode"])
     modes, consts, texts = {}, {}, {}
     for spec in SWEEP_PARAMS:
         key = spec["key"]
+        if not _spec_active(spec, sma200_mode):
+            modes[key] = "Constant"
+            consts[key] = spec["const_default"]
+            texts[key] = spec["sweep_default"]
+            continue
         c1, c2, c3 = st.columns([1.15, 1.25, 2.2])
         with c1:
             st.markdown(f"**{spec['label']}**")
@@ -1088,7 +1284,7 @@ def render_sweep(engine, prepared, meta, skipped):
                 )
                 consts[key] = st.session_state.get(f"sw_const_{key}", spec["const_default"])
 
-    combos, info, err = collect_sweep_grid(modes, consts, texts)
+    combos, info, err = collect_sweep_grid(modes, consts, texts, sma200_mode)
     if err:
         st.error(err)
         combos = []
@@ -1097,8 +1293,9 @@ def render_sweep(engine, prepared, meta, skipped):
         n_entry = info["n_entry"]
     n_combos = len(combos)
     eta = n_entry * SEC_PER_ENTRY_PASS
-    swept = [s["label"] for s in SWEEP_PARAMS if modes[s["key"]] == "Sweep"]
-    locked = [s["label"] for s in SWEEP_PARAMS if modes[s["key"]] == "Constant"]
+    active_specs = [s for s in SWEEP_PARAMS if _spec_active(s, sma200_mode)]
+    swept = [s["label"] for s in active_specs if modes[s["key"]] == "Sweep"]
+    locked = [s["label"] for s in active_specs if modes[s["key"]] == "Constant"]
     st.markdown(
         f'<div class="fb-note">Sweep {", ".join(swept) or "—"} · '
         f'lock {", ".join(locked) or "—"} · '
@@ -1167,7 +1364,12 @@ def render_sweep(engine, prepared, meta, skipped):
             st.session_state.drop_pct = int(round(-float(winner["drop"]) * 100))
             st.session_state.vol_mult = float(winner["vol_mult"])
             st.session_state.ema21_pct = int(round(-float(winner["ema21_dist"]) * 100))
-            st.session_state.sma200_max_days = int(winner["sma200_max_days"])
+            st.session_state.sma200_mode = winner.get("sma200_mode", "days_below")
+            st.session_state.sma200_max_days = int(winner.get("sma200_max_days", 25))
+            st.session_state.sma200_lookback = int(winner.get("sma200_lookback", 20))
+            st.session_state.sma200_min_above_pct = int(
+                round(float(winner.get("sma200_min_above_pct", 0.80)) * 100)
+            )
             st.session_state.exit_offset = int(winner["exit_offset"])
             st.session_state.min_entry_price = float(winner["min_entry_price"])
             st.session_state.require_eps_beat = bool(winner.get("require_eps_beat", False))
@@ -1183,7 +1385,10 @@ def render_sweep(engine, prepared, meta, skipped):
             "drop": st.column_config.NumberColumn("Drop", format="%.0%"),
             "vol_mult": st.column_config.NumberColumn("Vol", format="%.1f"),
             "ema21_dist": st.column_config.NumberColumn("EMA21", format="%.0%"),
+            "sma200_mode": st.column_config.TextColumn("SMA200 gate"),
             "sma200_max_days": st.column_config.NumberColumn("SMA200 d"),
+            "sma200_lookback": st.column_config.NumberColumn("SMA200 lookback"),
+            "sma200_min_above_pct": st.column_config.NumberColumn("SMA200 occ", format="0%"),
             "exit_offset": st.column_config.NumberColumn("t+"),
             "min_entry_price": st.column_config.NumberColumn("Px floor", format="$%.0f"),
             "n": st.column_config.NumberColumn("n", format="%d"),

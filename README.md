@@ -36,6 +36,11 @@ Public URL while this PC is on:
 
 First boot rebuilds moving averages and writes `prepared_dashboard.pkl` (gitignored).
 
+SMA200 gate is a radio on Tuner / Sweep:
+
+- **Max days below** (default): count of closes under SMA200 from the earnings close through entry.
+- **Occupancy**: last X sessions ending at entry, require Y% of closes ≥ SMA200. Default **20 sessions / 80%**. One-day bounce does not qualify a name that lived under SMA200.
+
 Optional EPS-beat filter (Yahoo `Surprise(%)` on the print you enter after, not GAAP NI):
 
 ```powershell
