@@ -45,6 +45,14 @@ SMA200_MODE_LABELS = {
     "days_below": "Max consecutive days below SMA200",
     "occupancy": "% of last X days above SMA200",
 }
+SMA200_MODE_SHORT = {
+    "days_below": "days-below",
+    "occupancy": "occupancy",
+}
+SMA200_GATE_ENGINE_KEYS = {
+    "days_below": ("sma200_max_days",),
+    "occupancy": ("sma200_lookback", "sma200_min_above_pct"),
+}
 
 
 def _load_engine():
@@ -401,7 +409,7 @@ SWEEP_PARAMS = [
         "unit": "% of lookback above",
         "kind": "int",
         "const_default": DEFAULTS["sma200_min_above_pct"],
-        "mode_default": "Constant",
+        "mode_default": "Sweep",
         "sweep_default": "60, 80, 90",
         "min": 50,
         "max": 100,
@@ -470,23 +478,38 @@ def parse_num_list(text: str, spec: dict) -> list:
     return out
 
 
-def _spec_active(spec: dict, sma200_mode: str) -> bool:
+def _normalize_sma200_gates(sma200_gates) -> list[str]:
+    wanted = set(sma200_gates or ())
+    return [g for g in ("days_below", "occupancy") if g in wanted]
+
+
+def _spec_active(spec: dict, sma200_gates) -> bool:
     allowed = spec.get("sma200_modes")
     if not allowed:
         return True
-    return sma200_mode in allowed
+    gates = set(_normalize_sma200_gates(sma200_gates))
+    return any(m in gates for m in allowed)
 
 
 def collect_sweep_grid(
-    modes: dict, const_vals: dict, sweep_text: dict, sma200_mode: str = "days_below"
+    modes: dict, const_vals: dict, sweep_text: dict, sma200_gates=None
 ):
-    """Return (engine_value_lists, display_lists, error) keyed by engine_key."""
+    """Cartesian product per selected SMA200 gate; union across gates.
+
+    Days-below and occupancy are alternative families, not AND-ed.
+    Unused gate params are filled with that param's constant / first value
+    so every combo dict has the full key set.
+    """
+    gates = _normalize_sma200_gates(sma200_gates)
+    if not gates:
+        return None, None, "Pick at least one SMA200 gate"
+
     display = {}
     engine_lists = {}
     for spec in SWEEP_PARAMS:
         key = spec["key"]
         ek = spec["engine_key"]
-        if not _spec_active(spec, sma200_mode):
+        if not _spec_active(spec, gates):
             raw = [spec["const_default"]]
             display[ek] = raw
             engine_lists[ek] = spec["to_engine"](raw)
@@ -500,12 +523,24 @@ def collect_sweep_grid(
                 return None, None, str(e)
         display[ek] = raw
         engine_lists[ek] = spec["to_engine"](raw)
-    keys = [s["engine_key"] for s in SWEEP_PARAMS]
+
+    shared_keys = [s["engine_key"] for s in SWEEP_PARAMS if not s.get("sma200_modes")]
+    dummy = {
+        s["engine_key"]: s["to_engine"]([s["const_default"]])[0]
+        for s in SWEEP_PARAMS
+        if s.get("sma200_modes")
+    }
+
     combos = []
-    for tup in itertools.product(*[engine_lists[k] for k in keys]):
-        row = dict(zip(keys, tup))
-        row["sma200_mode"] = sma200_mode
-        combos.append(row)
+    for gate in gates:
+        gkeys = list(SMA200_GATE_ENGINE_KEYS[gate])
+        keys = shared_keys + gkeys
+        for tup in itertools.product(*[engine_lists[k] for k in keys]):
+            row = dict(zip(keys, tup))
+            row["sma200_mode"] = gate
+            for k, v in dummy.items():
+                row.setdefault(k, v)
+            combos.append(row)
     n_entry = len({(c["drop"], c["vol_mult"], c["ema21_dist"]) for c in combos})
     return combos, {"n_entry": n_entry, "display": display}, None
 
@@ -553,11 +588,20 @@ def sweep_results_df(rows: list[dict]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
+    if "sma200_mode" in df.columns:
+        df["sma200"] = [
+            _sma200_pill(r)
+            for r in df.to_dict(orient="records")
+        ]
+        df["sma200_mode"] = df["sma200_mode"].map(
+            lambda m: SMA200_MODE_SHORT.get(m, m)
+        )
     cols = [
         "drop",
         "vol_mult",
         "ema21_dist",
         "sma200_mode",
+        "sma200",
         "sma200_max_days",
         "sma200_lookback",
         "sma200_min_above_pct",
@@ -783,6 +827,7 @@ def cache_caption(meta, prepared, skipped):
 def _ensure_defaults():
     for k, v in DEFAULTS.items():
         st.session_state.setdefault(k, v)
+    st.session_state.setdefault("sw_sma200_gates", ["days_below", "occupancy"])
 
 
 def _apply_sweep_preset(name: str):
@@ -797,14 +842,14 @@ def _apply_sweep_preset(name: str):
         "min_entry_price": DEFAULTS["min_entry_price"],
     }
     if name == "opt":
-        st.session_state.sma200_mode = "days_below"
+        st.session_state.sw_sma200_gates = ["days_below", "occupancy"]
         modes = {
             "drop_pct": "Sweep",
             "vol_mult": "Constant",
             "ema21_pct": "Sweep",
             "sma200_max_days": "Sweep",
             "sma200_lookback": "Constant",
-            "sma200_min_above_pct": "Constant",
+            "sma200_min_above_pct": "Sweep",
             "exit_offset": "Constant",
             "min_entry_price": "Constant",
         }
@@ -819,7 +864,7 @@ def _apply_sweep_preset(name: str):
             "min_entry_price": "0, 5",
         }
     else:
-        st.session_state.sma200_mode = DEFAULTS["sma200_mode"]
+        st.session_state.sw_sma200_gates = [DEFAULTS["sma200_mode"]]
         modes = {s["key"]: "Constant" for s in SWEEP_PARAMS}
         lists = {s["key"]: s["sweep_default"] for s in SWEEP_PARAMS}
     for k, v in modes.items():
@@ -1208,16 +1253,15 @@ def render_sweep(engine, prepared, meta, skipped):
                 "Missing estimate = skip. This is EPS vs consensus, not GAAP net income."
             ),
         )
-        sma200_mode = st.radio(
-            "SMA200 gate",
+        st.multiselect(
+            "SMA200 gates",
             options=["days_below", "occupancy"],
             format_func=lambda m: SMA200_MODE_LABELS[m],
-            key="sma200_mode",
+            key="sw_sma200_gates",
             help=(
-                "Days-below: consecutive closes under SMA200 ending at entry "
-                "(includes bars before the print). "
-                "Occupancy: last X sessions ending at entry, Y% of closes ≥ SMA200 "
-                "(default 20 / 80%)."
+                "Include one or both. The grid is a union, not an AND: "
+                "days-below combos only vary max consecutive days; occupancy "
+                "combos only vary lookback and % of last X days above SMA200."
             ),
         )
         st.divider()
@@ -1233,7 +1277,8 @@ def render_sweep(engine, prepared, meta, skipped):
 
     st.markdown(
         '<div class="fb-note">Constant = one value. Sweep = comma-separated list. '
-        "Cartesian product. Slow part is drop × vol × EMA21 (~12s per unique triple).</div>",
+        "Cartesian product inside each SMA200 family; days-below vs occupancy "
+        "are stacked, not AND-ed. Slow part is drop × vol × EMA21 (~12s per unique triple).</div>",
         unsafe_allow_html=True,
     )
 
@@ -1245,11 +1290,13 @@ def render_sweep(engine, prepared, meta, skipped):
         )
         st.session_state.setdefault(f"sw_list_{spec['key']}", spec["sweep_default"])
 
-    sma200_mode = st.session_state.get("sma200_mode", DEFAULTS["sma200_mode"])
+    sma200_gates = _normalize_sma200_gates(
+        st.session_state.get("sw_sma200_gates", ["days_below", "occupancy"])
+    )
     modes, consts, texts = {}, {}, {}
     for spec in SWEEP_PARAMS:
         key = spec["key"]
-        if not _spec_active(spec, sma200_mode):
+        if not _spec_active(spec, sma200_gates):
             modes[key] = "Constant"
             consts[key] = spec["const_default"]
             texts[key] = spec["sweep_default"]
@@ -1296,7 +1343,7 @@ def render_sweep(engine, prepared, meta, skipped):
                 )
                 consts[key] = st.session_state.get(f"sw_const_{key}", spec["const_default"])
 
-    combos, info, err = collect_sweep_grid(modes, consts, texts, sma200_mode)
+    combos, info, err = collect_sweep_grid(modes, consts, texts, sma200_gates)
     if err:
         st.error(err)
         combos = []
@@ -1305,7 +1352,7 @@ def render_sweep(engine, prepared, meta, skipped):
         n_entry = info["n_entry"]
     n_combos = len(combos)
     eta = n_entry * SEC_PER_ENTRY_PASS
-    active_specs = [s for s in SWEEP_PARAMS if _spec_active(s, sma200_mode)]
+    active_specs = [s for s in SWEEP_PARAMS if _spec_active(s, sma200_gates)]
     swept = [s["label"] for s in active_specs if modes[s["key"]] == "Sweep"]
     locked = [s["label"] for s in active_specs if modes[s["key"]] == "Constant"]
     st.markdown(
@@ -1397,7 +1444,8 @@ def render_sweep(engine, prepared, meta, skipped):
             "drop": st.column_config.NumberColumn("Drop", format="%.0%"),
             "vol_mult": st.column_config.NumberColumn("Vol", format="%.1f"),
             "ema21_dist": st.column_config.NumberColumn("EMA21", format="%.0%"),
-            "sma200_mode": st.column_config.TextColumn("SMA200 gate"),
+            "sma200_mode": st.column_config.TextColumn("SMA200 family"),
+            "sma200": st.column_config.TextColumn("SMA200"),
             "sma200_max_days": st.column_config.NumberColumn("SMA200 d"),
             "sma200_lookback": st.column_config.NumberColumn("SMA200 lookback"),
             "sma200_min_above_pct": st.column_config.NumberColumn("SMA200 occ", format="0%"),

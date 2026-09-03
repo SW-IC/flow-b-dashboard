@@ -36,10 +36,12 @@ Public URL while this PC is on:
 
 First boot rebuilds moving averages and writes `prepared_dashboard.pkl` (gitignored).
 
-SMA200 gate is a radio on Tuner / Sweep:
+SMA200 gate is a radio on Tuner. Sweep can include **both** families in one grid (union, not AND):
 
-- **Occupancy** (default): last X sessions ending at entry, require Y% of closes ≥ SMA200. Default combo is **drop −20% / vol 3.0× / EMA21 −10% / SMA200 80%/20d / t+3 / px ≥ $0**.
+- **Occupancy** (Tuner default): last X sessions ending at entry, require Y% of closes ≥ SMA200. Default combo is **drop −20% / vol 3.0× / EMA21 −10% / SMA200 80%/20d / t+3 / px ≥ $0**.
 - **Max consecutive days below**: consecutive closes under SMA200 ending at entry (walks backward through the print). A name that lived under SMA200 for months fails even if the post-print dump is 2 days.
+
+Sweep default includes days-below `10, 20, 25` **and** occupancy `60, 80, 90` (lookback locked at 20). Drop × EMA21 still cartesian-products inside each family.
 
 Optional EPS-beat filter (Yahoo `Surprise(%)` on the print you enter after, not GAAP NI):
 
