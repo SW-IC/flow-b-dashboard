@@ -29,10 +29,10 @@ PREPARED_NAME = "prepared_dashboard"
 PREPARED_VERSION = 1
 
 DEFAULTS = {
-    "drop_pct": 25,          # stored as positive %; engine uses negative
-    "vol_mult": 7.0,
-    "ema21_pct": 18,         # % below EMA21
-    "sma200_mode": "days_below",  # or "occupancy"
+    "drop_pct": 20,          # stored as positive %; engine uses negative
+    "vol_mult": 3.0,
+    "ema21_pct": 10,         # % below EMA21
+    "sma200_mode": "occupancy",  # or "days_below"
     "sma200_max_days": 25,
     "sma200_lookback": 20,
     "sma200_min_above_pct": 80,  # UI percent; engine uses 0.80
@@ -42,7 +42,7 @@ DEFAULTS = {
 }
 
 SMA200_MODE_LABELS = {
-    "days_below": "Max days below (anchor → entry)",
+    "days_below": "Max consecutive days below SMA200",
     "occupancy": "% of last X days above SMA200",
 }
 
@@ -328,7 +328,7 @@ SWEEP_PARAMS = [
         "label": "Drop",
         "unit": "% below earnings close",
         "kind": "int",
-        "const_default": 25,
+        "const_default": DEFAULTS["drop_pct"],
         "mode_default": "Sweep",
         "sweep_default": "20, 25",
         "min": 10,
@@ -342,7 +342,7 @@ SWEEP_PARAMS = [
         "label": "Vol spike",
         "unit": "× prior 20d avg",
         "kind": "float",
-        "const_default": 7.0,
+        "const_default": DEFAULTS["vol_mult"],
         "mode_default": "Constant",
         "sweep_default": "7, 10",
         "min": 3.0,
@@ -356,7 +356,7 @@ SWEEP_PARAMS = [
         "label": "EMA21",
         "unit": "% below",
         "kind": "int",
-        "const_default": 18,
+        "const_default": DEFAULTS["ema21_pct"],
         "mode_default": "Sweep",
         "sweep_default": "13, 15, 18",
         "min": 5,
@@ -370,7 +370,7 @@ SWEEP_PARAMS = [
         "label": "SMA200 days-below",
         "unit": "max days below",
         "kind": "int",
-        "const_default": 25,
+        "const_default": DEFAULTS["sma200_max_days"],
         "mode_default": "Sweep",
         "sweep_default": "10, 20, 25",
         "min": 0,
@@ -385,7 +385,7 @@ SWEEP_PARAMS = [
         "label": "SMA200 lookback",
         "unit": "sessions",
         "kind": "int",
-        "const_default": 20,
+        "const_default": DEFAULTS["sma200_lookback"],
         "mode_default": "Constant",
         "sweep_default": "10, 20, 40",
         "min": 5,
@@ -400,7 +400,7 @@ SWEEP_PARAMS = [
         "label": "SMA200 occupancy",
         "unit": "% of lookback above",
         "kind": "int",
-        "const_default": 80,
+        "const_default": DEFAULTS["sma200_min_above_pct"],
         "mode_default": "Constant",
         "sweep_default": "60, 80, 90",
         "min": 50,
@@ -415,7 +415,7 @@ SWEEP_PARAMS = [
         "label": "Exit",
         "unit": "sessions after next print",
         "kind": "int",
-        "const_default": 3,
+        "const_default": DEFAULTS["exit_offset"],
         "mode_default": "Constant",
         "sweep_default": "0, 3",
         "min": 0,
@@ -429,7 +429,7 @@ SWEEP_PARAMS = [
         "label": "Px floor",
         "unit": "$ (0 = off)",
         "kind": "float",
-        "const_default": 0.0,
+        "const_default": DEFAULTS["min_entry_price"],
         "mode_default": "Constant",
         "sweep_default": "0, 5",
         "min": 0.0,
@@ -780,16 +780,21 @@ def cache_caption(meta, prepared, skipped):
     )
 
 
+def _ensure_defaults():
+    for k, v in DEFAULTS.items():
+        st.session_state.setdefault(k, v)
+
+
 def _apply_sweep_preset(name: str):
     locked_const = {
-        "drop_pct": 25,
-        "vol_mult": 7.0,
-        "ema21_pct": 18,
-        "sma200_max_days": 25,
-        "sma200_lookback": 20,
-        "sma200_min_above_pct": 80,
-        "exit_offset": 3,
-        "min_entry_price": 0.0,
+        "drop_pct": DEFAULTS["drop_pct"],
+        "vol_mult": DEFAULTS["vol_mult"],
+        "ema21_pct": DEFAULTS["ema21_pct"],
+        "sma200_max_days": DEFAULTS["sma200_max_days"],
+        "sma200_lookback": DEFAULTS["sma200_lookback"],
+        "sma200_min_above_pct": DEFAULTS["sma200_min_above_pct"],
+        "exit_offset": DEFAULTS["exit_offset"],
+        "min_entry_price": DEFAULTS["min_entry_price"],
     }
     if name == "opt":
         st.session_state.sma200_mode = "days_below"
@@ -814,6 +819,7 @@ def _apply_sweep_preset(name: str):
             "min_entry_price": "0, 5",
         }
     else:
+        st.session_state.sma200_mode = DEFAULTS["sma200_mode"]
         modes = {s["key"]: "Constant" for s in SWEEP_PARAMS}
         lists = {s["key"]: s["sweep_default"] for s in SWEEP_PARAMS}
     for k, v in modes.items():
@@ -881,7 +887,7 @@ def render_trades(trades, *, download_name: str):
         "dist_ema21_pct": st.column_config.NumberColumn("EMA21 dist", format="+0.0%"),
         "days_below_sma200": st.column_config.NumberColumn(
             "Days < SMA200",
-            help="Closes below SMA200 from earnings close through entry. Not a trailing lookback.",
+            help="Consecutive closes below SMA200 ending at entry. Walks backward through the print.",
         ),
         "sma200_above_pct": st.column_config.NumberColumn(
             "SMA200 occupancy",
@@ -924,6 +930,7 @@ def render_trades(trades, *, download_name: str):
 
 
 def render_tuner(engine, prepared, meta, skipped):
+    _ensure_defaults()
     if "history" not in st.session_state:
         st.session_state.history = []
 
@@ -967,22 +974,25 @@ def render_tuner(engine, prepared, meta, skipped):
             format_func=lambda m: SMA200_MODE_LABELS[m],
             key="sma200_mode",
             help=(
-                "Days-below counts closes under SMA200 from the earnings close through entry. "
-                "A name that lived under SMA200 for months can still pass if that window is "
-                "short, or if a one-day bounce cuts the count. "
+                "Days-below: consecutive closes under SMA200 ending at entry "
+                "(walks backward through the print). A name that lived under SMA200 "
+                "for months fails even if the post-print dump is only 2 days. "
                 "Occupancy: last X sessions ending at entry, require Y% of closes ≥ SMA200. "
                 "Default 20 sessions / 80%. Incomplete SMA200 window = skip."
             ),
         )
         if sma200_mode == "days_below":
             sma200_max_days = st.slider(
-                "Max days below SMA200 (anchor → entry)",
+                "Max consecutive days below SMA200",
                 min_value=0,
                 max_value=60,
                 step=1,
                 value=DEFAULTS["sma200_max_days"],
                 key="sma200_max_days",
-                help="Skip until SMA200 exists. Then reject if price spent more than N days below it.",
+                help=(
+                    "Skip until SMA200 exists. Then reject if, as of entry, close has been "
+                    "below SMA200 for more than N consecutive sessions."
+                ),
             )
             sma200_lookback = int(
                 st.session_state.get("sma200_lookback", DEFAULTS["sma200_lookback"])
@@ -1172,6 +1182,7 @@ def render_tuner(engine, prepared, meta, skipped):
 
 
 def render_sweep(engine, prepared, meta, skipped):
+    _ensure_defaults()
     with st.sidebar:
         st.header("Sweep")
         rank_by = st.selectbox(
@@ -1203,7 +1214,8 @@ def render_sweep(engine, prepared, meta, skipped):
             format_func=lambda m: SMA200_MODE_LABELS[m],
             key="sma200_mode",
             help=(
-                "Days-below: count from earnings close through entry. "
+                "Days-below: consecutive closes under SMA200 ending at entry "
+                "(includes bars before the print). "
                 "Occupancy: last X sessions ending at entry, Y% of closes ≥ SMA200 "
                 "(default 20 / 80%)."
             ),

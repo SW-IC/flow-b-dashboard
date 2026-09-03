@@ -38,8 +38,8 @@ First boot rebuilds moving averages and writes `prepared_dashboard.pkl` (gitigno
 
 SMA200 gate is a radio on Tuner / Sweep:
 
-- **Max days below** (default): count of closes under SMA200 from the earnings close through entry.
-- **Occupancy**: last X sessions ending at entry, require Y% of closes ≥ SMA200. Default **20 sessions / 80%**. One-day bounce does not qualify a name that lived under SMA200.
+- **Occupancy** (default): last X sessions ending at entry, require Y% of closes ≥ SMA200. Default combo is **drop −20% / vol 3.0× / EMA21 −10% / SMA200 80%/20d / t+3 / px ≥ $0**.
+- **Max consecutive days below**: consecutive closes under SMA200 ending at entry (walks backward through the print). A name that lived under SMA200 for months fails even if the post-print dump is 2 days.
 
 Optional EPS-beat filter (Yahoo `Surprise(%)` on the print you enter after, not GAAP NI):
 

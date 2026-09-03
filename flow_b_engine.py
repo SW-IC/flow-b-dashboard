@@ -17,11 +17,11 @@ For each pair of consecutive earnings dates:
    enough below EMA21.
 3. Reject if a disqualifying volume spike occurred from anchor through entry.
 4. No trade until SMA200 exists (200 daily closes). Then one of two
-   SMA200 gates (dashboard radio; default is days-below):
-   - days-below: reject if close spent more than N days below SMA200
-     from anchor through entry (N swept: 10, 20, 25). A one-day pop
-     does not clear a name that lived under SMA200 before the print —
-     that window only starts at the earnings close.
+   SMA200 gates (dashboard radio; tuner default is occupancy):
+   - days-below: reject if, as of entry, close has been below SMA200
+     for more than N consecutive sessions (N swept: 10, 20, 25).
+     The streak walks backward through the print — a 2-day post-print
+     dump does not clear a name that lived under SMA200 for months.
    - occupancy: reject unless at least Y% of the last X sessions
      ending at entry (inclusive) closed at or above SMA200.
      Default X=20, Y=80. Incomplete window or missing SMA200 = skip.
@@ -838,8 +838,8 @@ def find_entries(prepared, drop_thresh, vol_mult, ema21_dist_thresh, require_eps
             end_idx = _priced_session_idx(px.index, next_ev_date)
             if start_idx >= len(px) or end_idx >= len(px) or end_idx <= start_idx:
                 continue
-            # SMA200 needs 200 daily closes. Skip the window until it exists
-            # at the earnings close so the days-below veto is not a no-op (NaN < x is False).
+            # SMA200 needs 200 daily closes. Skip until it exists at the
+            # earnings close so a missing MA cannot silently pass a gate.
             if pd.isna(sma200.iloc[start_idx]):
                 continue
 
@@ -861,11 +861,9 @@ def find_entries(prepared, drop_thresh, vol_mult, ema21_dist_thresh, require_eps
             if has_volume_spike(spike_prefix, start_idx, entry_idx):
                 continue
 
-            sma200_window = sma200.iloc[start_idx:entry_idx + 1]
-            if sma200_window.isna().any() or pd.isna(sma200.iloc[entry_idx]):
+            if pd.isna(sma200.iloc[entry_idx]):
                 continue
-            px_window = px.iloc[start_idx:entry_idx + 1]
-            days_below_sma200 = int((px_window < sma200_window).sum())
+            days_below_sma200 = consecutive_days_below_sma200(px, sma200, entry_idx)
 
             trading_days_in_period = end_idx - start_idx
             entry_offset_in_period = entry_idx - start_idx
@@ -888,6 +886,26 @@ def find_entries(prepared, drop_thresh, vol_mult, ema21_dist_thresh, require_eps
                 **_ma_fields(entry_price, mas, entry_date),
             })
     return rows
+
+
+def consecutive_days_below_sma200(px, sma200, entry_idx) -> int:
+    """Consecutive sessions ending at entry with close < SMA200.
+
+    Walks backward through the earnings print. Stops at the first close
+    at or above SMA200, or at the first bar where SMA200 does not exist.
+    """
+    i = int(entry_idx)
+    n = 0
+    while i >= 0:
+        s = sma200.iloc[i]
+        if pd.isna(s):
+            break
+        if px.iloc[i] < s:
+            n += 1
+            i -= 1
+            continue
+        break
+    return n
 
 
 def sma200_occupancy(px, sma200, entry_idx, lookback: int):
@@ -932,7 +950,11 @@ def filter_sma200(
     lookback: int = SMA200_OCC_LOOKBACK_DEFAULT,
     min_above_pct: float = SMA200_OCC_MIN_ABOVE_DEFAULT,
 ):
-    """Apply the selected SMA200 gate. Always attach occupancy for the table."""
+    """Apply the selected SMA200 gate. Always attach occupancy for the table.
+
+    days-below uses consecutive closes < SMA200 ending at entry (not the
+    print→entry window). occupancy uses last `lookback` sessions.
+    """
     attach_sma200_occupancy(entries, prepared, lookback)
     mode = (mode or SMA200_MODE_DAYS_BELOW).strip()
     if mode == SMA200_MODE_OCCUPANCY:
@@ -1262,7 +1284,7 @@ def _unit_test_sma200_occupancy():
     sma_gap.iloc[-3] = np.nan
     if pd.notna(sma200_occupancy(px80, sma_gap, 29, 20)):
         fails.append("NaN SMA200 in window should be NaN occupancy")
-    # filter: one-pop fails occupancy, 16/20 passes; days-below still counts window
+    # filter: one-pop fails occupancy, 16/20 passes; injected days-below count=0 keeps it
     prepared = {
         "POP": {
             "px": px,
@@ -1293,6 +1315,61 @@ def _unit_test_sma200_occupancy():
     return fails
 
 
+def _unit_test_sma200_days_below():
+    """Print→entry of 2 days must not clear a name under SMA200 for months."""
+    fails = []
+    idx = pd.bdate_range("2020-01-02", periods=40)
+    sma = pd.Series(100.0, index=idx)
+    # Always below, like ADCT: dump on the last 2 bars after a long stay under.
+    px = pd.Series(90.0, index=idx)
+    px.iloc[-2:] = 50.0
+    streak = consecutive_days_below_sma200(px, sma, 39)
+    if streak != 40:
+        fails.append(f"always-below streak expected 40, got {streak}")
+    # Last 5 below after a stretch above.
+    px5 = pd.Series(110.0, index=idx)
+    px5.iloc[-5:] = 90.0
+    streak5 = consecutive_days_below_sma200(px5, sma, 39)
+    if streak5 != 5:
+        fails.append(f"5-day dip streak expected 5, got {streak5}")
+    # Equal-to-SMA200 breaks the streak.
+    px_eq = px.copy()
+    px_eq.iloc[-6] = 100.0
+    streak_eq = consecutive_days_below_sma200(px_eq, sma, 39)
+    if streak_eq != 5:
+        fails.append(f"equal-to-SMA200 should break streak, got {streak_eq}")
+    # NaN SMA200 stops the count (does not treat NaN < x as False-and-continue).
+    sma_gap = sma.copy()
+    sma_gap.iloc[:10] = np.nan
+    streak_gap = consecutive_days_below_sma200(px, sma_gap, 39)
+    if streak_gap != 30:
+        fails.append(f"NaN SMA200 prefix should cap streak at 30, got {streak_gap}")
+
+    prepared = {
+        "ADCTLIKE": {"px": px, "mas": {"sma200": sma}},
+        "DIP5": {"px": px5, "mas": {"sma200": sma}},
+    }
+    long_e = [{"ticker": "ADCTLIKE", "days_below_sma200": streak, "_entry_idx": 39}]
+    dip_e = [{"ticker": "DIP5", "days_below_sma200": streak5, "_entry_idx": 39}]
+    rejected = filter_sma200(
+        list(long_e), prepared, mode=SMA200_MODE_DAYS_BELOW, max_days=20
+    )
+    kept = filter_sma200(
+        list(dip_e), prepared, mode=SMA200_MODE_DAYS_BELOW, max_days=20
+    )
+    if rejected:
+        fails.append("name under SMA200 for 40 consecutive days must fail max_days=20")
+    if len(kept) != 1:
+        fails.append("5-day dip under SMA200 must pass max_days=20")
+    # Occupancy still rejects the always-below name.
+    occ = filter_sma200(
+        list(long_e), prepared, mode=SMA200_MODE_OCCUPANCY, lookback=20, min_above_pct=0.80
+    )
+    if occ:
+        fails.append("always-below name must also fail occupancy 80%/20d")
+    return fails
+
+
 def stress_test_date_logic(
     prices_all=None,
     earnings_dict=None,
@@ -1310,6 +1387,7 @@ def stress_test_date_logic(
         _unit_test_priced_session()
         + _unit_test_surprise_parse()
         + _unit_test_sma200_occupancy()
+        + _unit_test_sma200_days_below()
     )
     stats = {
         "n_tickers": 0,
@@ -1329,6 +1407,26 @@ def stress_test_date_logic(
         "fails": fails,
         "ok": False,
     }
+
+    if prices_all is not None and "ADCT" in prices_all.columns:
+        px = _align_naive(prices_all["ADCT"]).dropna()
+        sma = px.rolling(200).mean()
+        entry = pd.Timestamp("2023-11-09")
+        if entry in px.index:
+            i = int(px.index.get_loc(entry))
+            streak = consecutive_days_below_sma200(px, sma, i)
+            if streak <= 20:
+                fails.append(
+                    f"ADCT 2023-11-09 consecutive days below SMA200 expected >20, got {streak}"
+                )
+            kept = filter_sma200(
+                [{"ticker": "ADCT", "days_below_sma200": streak, "_entry_idx": i}],
+                {"ADCT": {"px": px, "mas": {"sma200": sma}}},
+                mode=SMA200_MODE_DAYS_BELOW,
+                max_days=20,
+            )
+            if kept:
+                fails.append("ADCT 2023-11-09 must fail days-below max_days=20")
 
     if earnings_dict is not None and prices_all is not None:
         for tkr, dates in earnings_dict.items():
